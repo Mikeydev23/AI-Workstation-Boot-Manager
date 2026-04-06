@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+logs/*.log
+dist/
+build/
+*.spec
+.vscode/
+config/boot_modes.json
+legacy/

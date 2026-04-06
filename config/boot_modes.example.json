@@ -1,0 +1,633 @@
+{
+  "version": 1,
+  "auto_start_on_launch": false,
+  "confirm_step_delete": true,
+  "readiness_presets": [
+    {
+      "name": "main",
+      "type": "none",
+      "target": "",
+      "timeout_seconds": 60
+    }
+  ],
+  "selected_mode_id": "minimal-mode",
+  "modes": [
+    {
+      "id": "autherax-workflow-mode",
+      "name": "AutheraX Workflow Mode",
+      "steps": [
+        {
+          "name": "Tailscale",
+          "type": "path",
+          "path": "C:/Program Files/Tailscale/tailscale-ipn.exe",
+          "args": [],
+          "delay_after": 10,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "tailscale-ipn.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Docker Desktop",
+          "type": "path",
+          "path": "C:/Program Files/Docker/Docker/Docker Desktop.exe",
+          "args": [],
+          "delay_after": 45,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Docker Desktop.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Portmaster",
+          "type": "path",
+          "path": "C:/Program Files/Portmaster/portmaster.exe",
+          "args": [
+            "--with-prompts",
+            "--with-notifications",
+            "--background"
+          ],
+          "delay_after": 5,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "portmaster.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "VS Code",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [],
+          "delay_after": 5,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Code.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": true,
+            "window_match_mode": "process_name",
+            "window_match_value": "Code.exe",
+            "snap_x": 100,
+            "snap_y": 100,
+            "snap_width": 1440,
+            "snap_height": 900,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Open WebUI",
+          "type": "url",
+          "path": "http://127.0.0.1:3000",
+          "args": [],
+          "delay_after": 5,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "ai-image-generation",
+      "name": "AI Image Generation",
+      "steps": [
+        {
+          "name": "Tailscale",
+          "type": "path",
+          "path": "C:/Program Files/Tailscale/tailscale-ipn.exe",
+          "args": [],
+          "delay_after": 10,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "tailscale-ipn.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Docker Desktop",
+          "type": "path",
+          "path": "C:/Program Files/Docker/Docker/Docker Desktop.exe",
+          "args": [],
+          "delay_after": 45,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Docker Desktop.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "ComfyUI Launcher",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [],
+          "delay_after": 90,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "ComfyUI.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Open WebUI",
+          "type": "url",
+          "path": "http://127.0.0.1:3000",
+          "args": [],
+          "delay_after": 5,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "llm-development",
+      "name": "LLM Development",
+      "steps": [
+        {
+          "name": "Tailscale",
+          "type": "path",
+          "path": "C:/Program Files/Tailscale/tailscale-ipn.exe",
+          "args": [],
+          "delay_after": 10,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "tailscale-ipn.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Docker Desktop",
+          "type": "path",
+          "path": "C:/Program Files/Docker/Docker/Docker Desktop.exe",
+          "args": [],
+          "delay_after": 45,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Docker Desktop.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "LM Studio",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [],
+          "delay_after": 20,
+          "enabled": false,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "LM Studio.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "VS Code",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [],
+          "delay_after": 5,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Code.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": true,
+            "window_match_mode": "process_name",
+            "window_match_value": "Code.exe",
+            "snap_x": 50,
+            "snap_y": 50,
+            "snap_width": 1600,
+            "snap_height": 900,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Open WebUI",
+          "type": "url",
+          "path": "http://127.0.0.1:3000",
+          "args": [],
+          "delay_after": 5,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "normal-work-mode",
+      "name": "Normal Work Mode",
+      "steps": [
+        {
+          "name": "Browser",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [],
+          "delay_after": 3,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "browser.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Discord",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [
+            "--processStart",
+            "Discord.exe"
+          ],
+          "delay_after": 3,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Discord.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Obsidian",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [],
+          "delay_after": 3,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Obsidian.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": true,
+            "window_match_mode": "process_name",
+            "window_match_value": "Obsidian.exe",
+            "snap_x": 120,
+            "snap_y": 120,
+            "snap_width": 1280,
+            "snap_height": 800,
+            "snap_timeout_sec": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "minimal-mode",
+      "name": "Minimal Mode",
+      "steps": [
+        {
+          "name": "Tailscale",
+          "type": "path",
+          "path": "C:/Program Files/Tailscale/tailscale-ipn.exe",
+          "args": [],
+          "delay_after": 0,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "tailscale-ipn.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Portmaster",
+          "type": "path",
+          "path": "C:/Program Files/Portmaster/portmaster.exe",
+          "args": [],
+          "delay_after": 10,
+          "enabled": true,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "portmaster.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        },
+        {
+          "name": "Notes",
+          "type": "path",
+          "path": "C:/Path/To/Your/App.exe",
+          "args": [],
+          "delay_after": 5,
+          "enabled": false,
+          "readiness": {
+            "type": "none",
+            "target": "",
+            "timeout_seconds": 60
+          },
+          "process_ready": {
+            "enabled": false,
+            "name": "Notes.exe",
+            "timeout_seconds": 30,
+            "settle_delay_seconds": 0
+          },
+          "window_snap": {
+            "snap_enabled": false,
+            "window_match_mode": "none",
+            "window_match_value": "",
+            "snap_x": 0,
+            "snap_y": 0,
+            "snap_width": 1280,
+            "snap_height": 720,
+            "snap_timeout_sec": 15
+          }
+        }
+      ]
+    }
+  ]
+}
