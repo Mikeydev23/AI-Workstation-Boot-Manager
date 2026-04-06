@@ -13,8 +13,8 @@
   "selected_mode_id": "minimal-mode",
   "modes": [
     {
-      "id": "autherax-workflow-mode",
-      "name": "AutheraX Workflow Mode",
+      "id": "automation-workflow-mode",
+      "name": "Automation Workflow Mode",
       "steps": [
         {
           "name": "Tailscale",
