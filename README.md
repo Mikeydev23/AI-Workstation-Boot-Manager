@@ -79,7 +79,7 @@ Supported workflow examples include:
 
 - AI Image Generation
 - LLM Development
-- AutheraX Workflow Mode
+- Automation Workflow Mode
 - Normal Work Mode
 - Minimal Mode
 
