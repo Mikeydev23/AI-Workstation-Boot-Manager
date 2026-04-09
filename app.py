@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import ctypes
 import json
@@ -22,9 +23,15 @@ from urllib import error as urllib_error, request as urllib_request
 
 import customtkinter as ctk
 import psutil
+
 try:
-    from customtkinter.windows.widgets.core_widget_classes.dropdown_menu import DropdownMenu
-    from customtkinter.windows.widgets.scaling import CTkScalingBaseClass, ScalingTracker
+    from customtkinter.windows.widgets.core_widget_classes.dropdown_menu import (
+        DropdownMenu,
+    )
+    from customtkinter.windows.widgets.scaling import (
+        CTkScalingBaseClass,
+        ScalingTracker,
+    )
 except ImportError:  # pragma: no cover - defensive for package layout changes
     DropdownMenu = None
     CTkScalingBaseClass = None
@@ -42,6 +49,15 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 STEP_TYPES = ("path", "url")
 READINESS_TYPES = ("none", "port", "url")
 WINDOW_MATCH_MODES = ("none", "title_contains", "process_name")
+LAUNCH_METHODS = ("normal", "elevated_uac", "scheduled_task")
+LAUNCH_METHOD_LABELS = {
+    "normal": "Normal",
+    "elevated_uac": "Elevated (UAC)",
+    "scheduled_task": "Scheduled Task",
+}
+LAUNCH_METHOD_VALUES_BY_LABEL = {
+    label: value for value, label in LAUNCH_METHOD_LABELS.items()
+}
 EXCLUDED_PROCESS_NAMES = {
     "system",
     "registry",
@@ -331,9 +347,15 @@ READINESS_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_READINESS_TIMEOUT_SECONDS = 60
 DEFAULT_PROCESS_READY_TIMEOUT_SECONDS = 30
 DEFAULT_WINDOW_SNAP_TIMEOUT_SECONDS = 15
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30
 WINDOW_SNAP_POLL_INTERVAL_SECONDS = 0.5
+HEARTBEAT_UNKNOWN = "unknown"
+HEARTBEAT_HEALTHY = "healthy"
+HEARTBEAT_UNHEALTHY = "unhealthy"
 SCAN_PATH_DISPLAY_MAX = 100
 SCAN_ARGS_DISPLAY_MAX = 140
+PROCESS_SCAN_SEARCH_DEBOUNCE_MS = 200
+PROCESS_SCAN_BACKGROUND_RENDER_CAP = 100
 STEP_CARD_PADX = 6
 STEP_CARD_PADY = 2
 STEP_CARD_INNER_PADX = 8
@@ -361,6 +383,8 @@ DEFAULT_CONFIG = {
     "version": 1,
     "auto_start_on_launch": False,
     "confirm_step_delete": True,
+    "heartbeat_enabled": True,
+    "heartbeat_interval_seconds": DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     "readiness_presets": [],
     "selected_mode_id": "ai-image-generation",
     "modes": [
@@ -642,6 +666,19 @@ def validate_config(payload: object) -> dict:
     if not isinstance(confirm_step_delete, bool):
         raise ConfigError("'confirm_step_delete' must be a boolean.")
 
+    heartbeat_enabled = payload.get("heartbeat_enabled", True)
+    if not isinstance(heartbeat_enabled, bool):
+        raise ConfigError("'heartbeat_enabled' must be a boolean.")
+
+    heartbeat_interval_seconds = payload.get(
+        "heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+    )
+    if (
+        not isinstance(heartbeat_interval_seconds, int)
+        or heartbeat_interval_seconds <= 0
+    ):
+        raise ConfigError("'heartbeat_interval_seconds' must be a positive integer.")
+
     readiness_presets = payload.get("readiness_presets", [])
     if not isinstance(readiness_presets, list):
         raise ConfigError("'readiness_presets' must be a list.")
@@ -662,7 +699,9 @@ def validate_config(payload: object) -> dict:
         normalized_preset = normalize_readiness_preset(preset)
         preset_name = normalized_preset["name"]
         if not preset_name:
-            raise ConfigError(f"Readiness preset #{preset_index} is missing a valid 'name'.")
+            raise ConfigError(
+                f"Readiness preset #{preset_index} is missing a valid 'name'."
+            )
         if preset_name.lower() in seen_preset_names:
             raise ConfigError(f"Duplicate readiness preset name '{preset_name}' found.")
         if normalized_preset["type"] == "port":
@@ -672,9 +711,9 @@ def validate_config(payload: object) -> dict:
                 raise ConfigError(
                     f"Readiness preset '{preset_name}' has invalid port target: {exc}"
                 ) from exc
-        if normalized_preset["type"] == "url" and not normalized_preset["target"].startswith(
-            ("http://", "https://")
-        ):
+        if normalized_preset["type"] == "url" and not normalized_preset[
+            "target"
+        ].startswith(("http://", "https://")):
             raise ConfigError(
                 f"Readiness preset '{preset_name}' must use a URL starting with http:// or https://."
             )
@@ -703,7 +742,9 @@ def validate_config(payload: object) -> dict:
         validated_steps = []
         for step_index, step in enumerate(steps, start=1):
             if not isinstance(step, dict):
-                raise ConfigError(f"Step #{step_index} in mode '{mode_id}' must be an object.")
+                raise ConfigError(
+                    f"Step #{step_index} in mode '{mode_id}' must be an object."
+                )
 
             name = step.get("name")
             step_type = step.get("type")
@@ -711,6 +752,9 @@ def validate_config(payload: object) -> dict:
             args = step.get("args")
             delay_after = step.get("delay_after")
             enabled = step.get("enabled")
+            raw_run_as_admin = step.get("run_as_admin", False)
+            raw_launch_method = step.get("launch_method")
+            raw_scheduled_task_name = step.get("scheduled_task_name", "")
             readiness = normalize_readiness_config(step.get("readiness"))
             process_ready = normalize_process_ready_config(
                 step.get("process_ready"),
@@ -728,19 +772,43 @@ def validate_config(payload: object) -> dict:
                     f"Step '{name}' in mode '{mode_id}' has invalid type '{step_type}'."
                 )
             if not isinstance(path, str):
-                raise ConfigError(f"Step '{name}' in mode '{mode_id}' has invalid 'path'.")
+                raise ConfigError(
+                    f"Step '{name}' in mode '{mode_id}' has invalid 'path'."
+                )
             if step_type == "url" and not path.startswith(("http://", "https://")):
                 raise ConfigError(
                     f"Step '{name}' in mode '{mode_id}' must use a URL starting with http:// or https://."
                 )
-            if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
-                raise ConfigError(f"Step '{name}' in mode '{mode_id}' has invalid 'args'.")
+            if not isinstance(args, list) or any(
+                not isinstance(item, str) for item in args
+            ):
+                raise ConfigError(
+                    f"Step '{name}' in mode '{mode_id}' has invalid 'args'."
+                )
             if not isinstance(delay_after, int) or delay_after < 0:
                 raise ConfigError(
                     f"Step '{name}' in mode '{mode_id}' must have a non-negative integer delay."
                 )
             if not isinstance(enabled, bool):
-                raise ConfigError(f"Step '{name}' in mode '{mode_id}' has invalid 'enabled'.")
+                raise ConfigError(
+                    f"Step '{name}' in mode '{mode_id}' has invalid 'enabled'."
+                )
+            if not isinstance(raw_run_as_admin, bool):
+                raise ConfigError(
+                    f"Step '{name}' in mode '{mode_id}' has invalid 'run_as_admin'."
+                )
+            if raw_launch_method is not None:
+                if (
+                    not isinstance(raw_launch_method, str)
+                    or raw_launch_method.strip() not in LAUNCH_METHODS
+                ):
+                    raise ConfigError(
+                        f"Step '{name}' in mode '{mode_id}' has invalid 'launch_method'."
+                    )
+            if not isinstance(raw_scheduled_task_name, str):
+                raise ConfigError(
+                    f"Step '{name}' in mode '{mode_id}' has invalid 'scheduled_task_name'."
+                )
             if readiness["type"] == "port":
                 try:
                     parse_host_port_target(readiness["target"])
@@ -775,7 +843,10 @@ def validate_config(payload: object) -> dict:
                 raise ConfigError(
                     f"Step '{name}' in mode '{mode_id}' has invalid window match mode."
                 )
-            if window_snap["snap_enabled"] and window_snap["window_match_mode"] != "none":
+            if (
+                window_snap["snap_enabled"]
+                and window_snap["window_match_mode"] != "none"
+            ):
                 if not window_snap["window_match_value"]:
                     raise ConfigError(
                         f"Step '{name}' in mode '{mode_id}' must define 'window_match_value' when window snapping is enabled."
@@ -789,6 +860,10 @@ def validate_config(payload: object) -> dict:
                         f"Step '{name}' in mode '{mode_id}' must use a positive snap timeout."
                     )
 
+            launch_method = normalize_launch_method(
+                raw_launch_method,
+                legacy_run_as_admin=normalize_run_as_admin(raw_run_as_admin),
+            )
             validated_steps.append(
                 {
                     "name": name.strip(),
@@ -797,13 +872,17 @@ def validate_config(payload: object) -> dict:
                     "args": list(args),
                     "delay_after": delay_after,
                     "enabled": enabled,
+                    "launch_method": launch_method,
+                    "scheduled_task_name": raw_scheduled_task_name.strip(),
                     "readiness": readiness,
                     "process_ready": process_ready,
                     "window_snap": window_snap,
                 }
             )
 
-        validated_modes.append({"id": mode_id, "name": mode_name.strip(), "steps": validated_steps})
+        validated_modes.append(
+            {"id": mode_id, "name": mode_name.strip(), "steps": validated_steps}
+        )
 
     resolved_selected_mode_id = selected_mode_id
     if validated_modes:
@@ -817,6 +896,8 @@ def validate_config(payload: object) -> dict:
         "version": 1,
         "auto_start_on_launch": auto_start_on_launch,
         "confirm_step_delete": confirm_step_delete,
+        "heartbeat_enabled": heartbeat_enabled,
+        "heartbeat_interval_seconds": heartbeat_interval_seconds,
         "readiness_presets": validated_readiness_presets,
         "selected_mode_id": resolved_selected_mode_id,
         "modes": validated_modes,
@@ -848,7 +929,9 @@ def load_or_create_config() -> dict:
         with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except json.JSONDecodeError as exc:
-        raise ConfigError(f"JSON parse error at line {exc.lineno}, column {exc.colno}: {exc.msg}") from exc
+        raise ConfigError(
+            f"JSON parse error at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
     except OSError as exc:
         raise ConfigError(f"Unable to read config file: {exc}") from exc
 
@@ -919,6 +1002,26 @@ def normalize_readiness_preset(value: object) -> dict:
     }
 
 
+def normalize_run_as_admin(value: object) -> bool:
+    return bool(value) if isinstance(value, bool) else False
+
+
+def normalize_launch_method(value: object, legacy_run_as_admin: bool = False) -> str:
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized in LAUNCH_METHODS:
+            return normalized
+    return "elevated_uac" if legacy_run_as_admin else "normal"
+
+
+def get_launch_method_label(value: str) -> str:
+    return LAUNCH_METHOD_LABELS.get(value, LAUNCH_METHOD_LABELS["normal"])
+
+
+def get_launch_method_value_from_label(label: str) -> str:
+    return LAUNCH_METHOD_VALUES_BY_LABEL.get(label, "normal")
+
+
 def derive_default_process_ready_name(step_type: str, path: str) -> str:
     if step_type != "path":
         return ""
@@ -942,7 +1045,9 @@ def make_default_process_ready() -> dict:
     }
 
 
-def normalize_process_ready_config(value: object, step_type: str = "path", path: str = "") -> dict:
+def normalize_process_ready_config(
+    value: object, step_type: str = "path", path: str = ""
+) -> dict:
     process_ready = make_default_process_ready()
     if not isinstance(value, dict):
         process_ready["name"] = derive_default_process_ready_name(step_type, path)
@@ -955,7 +1060,9 @@ def normalize_process_ready_config(value: object, step_type: str = "path", path:
     if isinstance(process_name, str):
         process_ready["name"] = process_name.strip()
 
-    timeout_seconds = value.get("timeout_seconds", DEFAULT_PROCESS_READY_TIMEOUT_SECONDS)
+    timeout_seconds = value.get(
+        "timeout_seconds", DEFAULT_PROCESS_READY_TIMEOUT_SECONDS
+    )
     if isinstance(timeout_seconds, int) and timeout_seconds > 0:
         process_ready["timeout_seconds"] = timeout_seconds
 
@@ -1069,9 +1176,14 @@ def get_visible_window_titles_by_pid() -> dict[int, list[str]]:
         return {}
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    enum_windows_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    enum_windows_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
     get_window_thread_process_id = user32.GetWindowThreadProcessId
-    get_window_thread_process_id.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    get_window_thread_process_id.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     get_window_thread_process_id.restype = wintypes.DWORD
 
     is_window_visible = user32.IsWindowVisible
@@ -1124,10 +1236,15 @@ def enumerate_visible_top_level_windows() -> list[dict]:
         return []
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    enum_windows_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    enum_windows_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
 
     get_window_thread_process_id = user32.GetWindowThreadProcessId
-    get_window_thread_process_id.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    get_window_thread_process_id.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     get_window_thread_process_id.restype = wintypes.DWORD
 
     is_window_visible = user32.IsWindowVisible
@@ -1290,7 +1407,10 @@ def should_exclude_scanned_process(name: str, executable_path: str) -> bool:
     normalized_name = name.strip().lower()
     executable_name = Path(executable_path).name.lower()
 
-    if normalized_name in EXCLUDED_PROCESS_NAMES or executable_name in EXCLUDED_PROCESS_NAMES:
+    if (
+        normalized_name in EXCLUDED_PROCESS_NAMES
+        or executable_name in EXCLUDED_PROCESS_NAMES
+    ):
         return True
     return False
 
@@ -1323,7 +1443,10 @@ def looks_like_editor_helper_process(
 
 
 def looks_like_service_or_helper_process(
-    normalized_name: str, executable_name: str, normalized_path: str, lowered_args: list[str]
+    normalized_name: str,
+    executable_name: str,
+    normalized_path: str,
+    lowered_args: list[str],
 ) -> bool:
     joined_args = " ".join(lowered_args)
 
@@ -1335,7 +1458,11 @@ def looks_like_service_or_helper_process(
         return True
     if any(arg.startswith(BROWSER_HELPER_ARG_PREFIXES) for arg in lowered_args):
         return True
-    if any(substring in arg for arg in lowered_args for substring in EXCLUDED_ARG_SUBSTRINGS):
+    if any(
+        substring in arg
+        for arg in lowered_args
+        for substring in EXCLUDED_ARG_SUBSTRINGS
+    ):
         return True
     if "--extension-process" in lowered_args or "--crashpad-handler" in lowered_args:
         return True
@@ -1404,7 +1531,10 @@ def classify_scanned_process(
 
     if is_excluded_service_account(username):
         return "background"
-    if normalized_name in BACKGROUND_PROCESS_NAMES or executable_name in BACKGROUND_PROCESS_NAMES:
+    if (
+        normalized_name in BACKGROUND_PROCESS_NAMES
+        or executable_name in BACKGROUND_PROCESS_NAMES
+    ):
         return "background"
     if looks_like_service_or_helper_process(
         normalized_name, executable_name, normalized_path, lowered_args
@@ -1420,7 +1550,9 @@ def classify_scanned_process(
         return "user" if has_meaningful_launch_args(args) else "background"
     if executable_name in LIKELY_USER_APP_NAMES:
         return "user"
-    if is_probably_user_install_path(normalized_path) and has_meaningful_launch_args(args):
+    if is_probably_user_install_path(normalized_path) and has_meaningful_launch_args(
+        args
+    ):
         return "user"
 
     return "background"
@@ -1469,7 +1601,9 @@ def collapse_user_app_entries(entries: list[dict]) -> list[dict]:
             entry_args = tuple(entry["args"])
             if entry_args in retained_signatures:
                 continue
-            if entry["has_visible_window"] and has_meaningful_launch_args(entry["args"]):
+            if entry["has_visible_window"] and has_meaningful_launch_args(
+                entry["args"]
+            ):
                 retained_entries.append(entry)
                 retained_signatures.add(entry_args)
 
@@ -1480,7 +1614,9 @@ def collapse_user_app_entries(entries: list[dict]) -> list[dict]:
 
 def derive_import_step_name(process_name: str, executable_path: str) -> str:
     if process_name:
-        return process_name[:-4] if process_name.lower().endswith(".exe") else process_name
+        return (
+            process_name[:-4] if process_name.lower().endswith(".exe") else process_name
+        )
     return Path(executable_path).stem or executable_path
 
 
@@ -1552,7 +1688,9 @@ def apply_customtkinter_stability_patches() -> None:
     ScalingTracker.update_scaling_callbacks_for_window = classmethod(
         safe_update_scaling_callbacks_for_window
     )
-    ScalingTracker.update_scaling_callbacks_all = classmethod(safe_update_scaling_callbacks_all)
+    ScalingTracker.update_scaling_callbacks_all = classmethod(
+        safe_update_scaling_callbacks_all
+    )
     ctk._aiwbm_stability_patched = True
 
 
@@ -1563,11 +1701,22 @@ class ProcessScanDialog(ctk.CTkToplevel):
     def __init__(self, parent: "BootManagerApp", process_entries: list[dict]) -> None:
         super().__init__(parent)
         self.parent = parent
-        self.process_entries = process_entries
+        self.process_entries = [self.prepare_entry(entry) for entry in process_entries]
         self.selection_vars: dict[tuple[str, tuple[str, ...]], ctk.BooleanVar] = {}
         self.search_var = ctk.StringVar(value="")
         self.show_user_apps_var = ctk.BooleanVar(value=True)
         self.show_background_var = ctk.BooleanVar(value=False)
+        self.pending_refresh_after_id: str | None = None
+        self.last_render_key: (
+            tuple[
+                tuple[tuple[str, tuple[str, ...]], ...],
+                tuple[tuple[str, tuple[str, ...]], ...],
+                bool,
+                bool,
+                int,
+            ]
+            | None
+        ) = None
 
         self.title("Scan Running Apps")
         self.geometry("1080x720")
@@ -1626,11 +1775,14 @@ class ProcessScanDialog(ctk.CTkToplevel):
         self.list_frame = ctk.CTkScrollableFrame(self, corner_radius=12)
         self.list_frame.grid(row=1, column=0, padx=20, pady=(0, 14), sticky="nsew")
         self.list_frame.grid_columnconfigure(0, weight=1)
+        parent.tune_scrollable_frame(self.list_frame, yscrollincrement=16)
 
         footer = ctk.CTkFrame(self, fg_color="transparent")
         footer.grid(row=2, column=0, padx=20, pady=(0, 20), sticky="e")
 
-        cancel_button = ctk.CTkButton(footer, text="Cancel", width=110, command=self.destroy)
+        cancel_button = ctk.CTkButton(
+            footer, text="Cancel", width=110, command=self.destroy
+        )
         cancel_button.grid(row=0, column=0, padx=(0, 10))
 
         import_button = ctk.CTkButton(
@@ -1638,50 +1790,99 @@ class ProcessScanDialog(ctk.CTkToplevel):
         )
         import_button.grid(row=0, column=1)
 
-        self.search_var.trace_add("write", self.refresh_list)
-        self.show_user_apps_var.trace_add("write", self.refresh_list)
-        self.show_background_var.trace_add("write", self.refresh_list)
+        self.search_var.trace_add("write", self.schedule_refresh_list)
+        self.show_user_apps_var.trace_add("write", self.schedule_refresh_list)
+        self.show_background_var.trace_add("write", self.schedule_refresh_list)
 
         self.refresh_list()
         self.after(50, self.focus)
         self.grab_set()
 
-    def refresh_list(self, *_args: object) -> None:
-        for child in self.list_frame.winfo_children():
-            child.destroy()
+    def prepare_entry(self, entry: dict) -> dict:
+        prepared_entry = dict(entry)
+        args_text = (
+            args_to_text(prepared_entry["args"]) if prepared_entry["args"] else "(none)"
+        )
+        prepared_entry["_display_path"] = truncate_display_text(
+            prepared_entry["path"], SCAN_PATH_DISPLAY_MAX
+        )
+        prepared_entry["_display_args"] = truncate_display_text(
+            args_text, SCAN_ARGS_DISPLAY_MAX
+        )
+        prepared_entry["_display_window_title"] = (
+            truncate_display_text(
+                prepared_entry["window_titles"][0], VISIBLE_WINDOW_TITLE_MAX
+            )
+            if prepared_entry.get("window_titles")
+            else ""
+        )
+        prepared_entry["_search_text"] = " ".join(
+            [
+                prepared_entry["display_name"],
+                prepared_entry["path"],
+                args_text,
+                " ".join(prepared_entry.get("window_titles", [])),
+            ]
+        ).lower()
+        return prepared_entry
 
+    def schedule_refresh_list(self, *_args: object) -> None:
+        if self.pending_refresh_after_id is not None:
+            try:
+                self.after_cancel(self.pending_refresh_after_id)
+            except TclError:
+                pass
+        self.pending_refresh_after_id = self.after(
+            PROCESS_SCAN_SEARCH_DEBOUNCE_MS, self.refresh_list
+        )
+
+    def refresh_list(self, *_args: object) -> None:
+        self.pending_refresh_after_id = None
         search_text = self.search_var.get().strip().lower()
         show_user = bool(self.show_user_apps_var.get())
         show_background = bool(self.show_background_var.get())
 
-        visible_entries = []
+        user_entries: list[dict] = []
+        background_entries: list[dict] = []
         for entry in self.process_entries:
             if entry["classification"] == "user" and not show_user:
                 continue
             if entry["classification"] == "background" and not show_background:
                 continue
 
-            if search_text:
-                haystack = " ".join(
-                    [
-                        entry["display_name"],
-                        entry["path"],
-                        args_to_text(entry["args"]),
-                        " ".join(entry.get("window_titles", [])),
-                    ]
-                ).lower()
-                if search_text not in haystack:
-                    continue
+            if search_text and search_text not in entry["_search_text"]:
+                continue
 
-            visible_entries.append(entry)
+            if entry["classification"] == "user":
+                user_entries.append(entry)
+            else:
+                background_entries.append(entry)
+
+        capped_background_entries = background_entries[
+            :PROCESS_SCAN_BACKGROUND_RENDER_CAP
+        ]
+        render_key = (
+            tuple(entry["signature"] for entry in user_entries),
+            tuple(entry["signature"] for entry in capped_background_entries),
+            show_user,
+            show_background,
+            len(background_entries),
+        )
+        if render_key == self.last_render_key:
+            return
+        self.last_render_key = render_key
+
+        for child in self.list_frame.winfo_children():
+            child.destroy()
 
         row_index = 0
-        row_index = self.render_group("User Apps", "user", visible_entries, row_index)
+        row_index = self.render_group("User Apps", user_entries, row_index)
         row_index = self.render_group(
             "Background/System/Helper",
-            "background",
-            visible_entries,
+            capped_background_entries,
             row_index,
+            total_count=len(background_entries),
+            was_capped=len(background_entries) > len(capped_background_entries),
         )
 
         if row_index == 0:
@@ -1693,85 +1894,106 @@ class ProcessScanDialog(ctk.CTkToplevel):
             empty_label.grid(row=0, column=0, padx=12, pady=18, sticky="w")
 
     def render_group(
-        self, title: str, classification: str, visible_entries: list[dict], row_index: int
+        self,
+        title: str,
+        entries: list[dict],
+        row_index: int,
+        total_count: int | None = None,
+        was_capped: bool = False,
     ) -> int:
-        group_entries = [entry for entry in visible_entries if entry["classification"] == classification]
-        if not group_entries:
+        if not entries:
             return row_index
 
         group_label = ctk.CTkLabel(
             self.list_frame,
-            text=f"{title} ({len(group_entries)})",
+            text=f"{title} ({total_count if total_count is not None else len(entries)})",
             font=ctk.CTkFont(size=17, weight="bold"),
             anchor="w",
         )
         group_label.grid(row=row_index, column=0, padx=12, pady=(8, 6), sticky="ew")
         row_index += 1
 
-        for entry in group_entries:
+        if was_capped:
+            capped_label = ctk.CTkLabel(
+                self.list_frame,
+                text=(
+                    f"Showing first {PROCESS_SCAN_BACKGROUND_RENDER_CAP} background/system "
+                    "entries. Refine search to narrow results."
+                ),
+                text_color=("gray35", "gray70"),
+                anchor="w",
+            )
+            capped_label.grid(
+                row=row_index, column=0, padx=12, pady=(0, 6), sticky="ew"
+            )
+            row_index += 1
+
+        for entry in entries:
             signature = entry["signature"]
-            selected_var = self.selection_vars.setdefault(signature, ctk.BooleanVar(value=False))
+            selected_var = self.selection_vars.setdefault(
+                signature, ctk.BooleanVar(value=False)
+            )
 
-            card = ctk.CTkFrame(self.list_frame, corner_radius=10)
-            card.grid(row=row_index, column=0, padx=8, pady=8, sticky="ew")
-            card.grid_columnconfigure(1, weight=1)
+            row_frame = ctk.CTkFrame(self.list_frame, corner_radius=8)
+            row_frame.grid(row=row_index, column=0, padx=8, pady=4, sticky="ew")
+            row_frame.grid_columnconfigure(1, weight=1)
 
-            checkbox = ctk.CTkCheckBox(card, text="", variable=selected_var, width=24)
-            checkbox.grid(row=0, column=0, rowspan=4, padx=(14, 8), pady=14, sticky="n")
+            checkbox = ctk.CTkCheckBox(
+                row_frame, text="", variable=selected_var, width=24
+            )
+            checkbox.grid(row=0, column=0, rowspan=3, padx=(12, 8), pady=10, sticky="n")
 
             title_label = ctk.CTkLabel(
-                card,
+                row_frame,
                 text=entry["display_name"],
-                font=ctk.CTkFont(size=16, weight="bold"),
+                font=ctk.CTkFont(size=14, weight="bold"),
                 anchor="w",
             )
-            title_label.grid(row=0, column=1, padx=(0, 14), pady=(12, 4), sticky="ew")
+            title_label.grid(row=0, column=1, padx=(0, 12), pady=(8, 1), sticky="ew")
 
-            truncated_path = truncate_display_text(entry["path"], SCAN_PATH_DISPLAY_MAX)
-            path_label = ctk.CTkLabel(
-                card,
-                text=f"Path: {truncated_path}",
+            details_label = ctk.CTkLabel(
+                row_frame,
+                text=f"{entry['_display_path']}  |  {entry['_display_args']}",
                 justify="left",
-                wraplength=840,
                 anchor="w",
-            )
-            path_label.grid(row=1, column=1, padx=(0, 14), pady=2, sticky="ew")
-
-            args_text = args_to_text(entry["args"]) if entry["args"] else "(none)"
-            truncated_args = truncate_display_text(args_text, SCAN_ARGS_DISPLAY_MAX)
-            args_label = ctk.CTkLabel(
-                card,
-                text=f"Args: {truncated_args}",
-                justify="left",
-                wraplength=840,
-                anchor="w",
+                wraplength=860,
                 text_color=("gray30", "gray70"),
+                font=ctk.CTkFont(size=12),
             )
-            args_label.grid(row=2, column=1, padx=(0, 14), pady=(2, 12), sticky="ew")
+            details_label.grid(row=1, column=1, padx=(0, 12), pady=(0, 8), sticky="ew")
 
-            if entry.get("window_titles"):
-                window_title = truncate_display_text(
-                    entry["window_titles"][0], VISIBLE_WINDOW_TITLE_MAX
-                )
+            if entry["classification"] == "user" and entry["_display_window_title"]:
                 window_label = ctk.CTkLabel(
-                    card,
-                    text=f"Window: {window_title}",
+                    row_frame,
+                    text=f"Window: {entry['_display_window_title']}",
                     justify="left",
-                    wraplength=840,
                     anchor="w",
-                    text_color=("gray30", "gray70"),
+                    text_color=("gray35", "gray70"),
+                    font=ctk.CTkFont(size=11),
                 )
-                window_label.grid(row=3, column=1, padx=(0, 14), pady=(0, 12), sticky="ew")
+                window_label.grid(
+                    row=2, column=1, padx=(0, 12), pady=(0, 8), sticky="ew"
+                )
 
             row_index += 1
 
         return row_index
 
+    def destroy(self) -> None:
+        if self.pending_refresh_after_id is not None:
+            try:
+                self.after_cancel(self.pending_refresh_after_id)
+            except TclError:
+                pass
+            self.pending_refresh_after_id = None
+        super().destroy()
+
     def import_selected(self) -> None:
         selected_entries = [
             entry
             for entry in self.process_entries
-            if self.selection_vars.get(entry["signature"]) and self.selection_vars[entry["signature"]].get()
+            if self.selection_vars.get(entry["signature"])
+            and self.selection_vars[entry["signature"]].get()
         ]
         self.parent.import_scanned_processes(selected_entries)
         self.destroy()
@@ -1929,13 +2151,17 @@ class ReadinessPresetsDialog(ctk.CTkToplevel):
             text="Preset Details",
             font=ctk.CTkFont(size=16, weight="bold"),
         )
-        fields_title.grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 8), sticky="w")
+        fields_title.grid(
+            row=0, column=0, columnspan=2, padx=12, pady=(12, 8), sticky="w"
+        )
 
         name_label = ctk.CTkLabel(right_panel, text="Name")
         name_label.grid(row=1, column=0, padx=12, pady=(0, 2), sticky="w")
 
         name_entry = ctk.CTkEntry(right_panel, textvariable=self.name_var, height=30)
-        name_entry.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="ew")
+        name_entry.grid(
+            row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="ew"
+        )
 
         type_label = ctk.CTkLabel(right_panel, text="Readiness Type")
         type_label.grid(row=3, column=0, padx=12, pady=(0, 2), sticky="w")
@@ -1955,7 +2181,9 @@ class ReadinessPresetsDialog(ctk.CTkToplevel):
         timeout_label = ctk.CTkLabel(right_panel, text="Timeout")
         timeout_label.grid(row=5, column=1, padx=(0, 12), pady=(0, 2), sticky="w")
 
-        self.target_entry = ctk.CTkEntry(right_panel, textvariable=self.target_var, height=30)
+        self.target_entry = ctk.CTkEntry(
+            right_panel, textvariable=self.target_var, height=30
+        )
         self.target_entry.grid(row=6, column=0, padx=12, pady=(0, 8), sticky="ew")
 
         timeout_entry = ctk.CTkEntry(
@@ -2067,14 +2295,22 @@ class ReadinessPresetsDialog(ctk.CTkToplevel):
         readiness_type = self.type_var.get()
         if readiness_type == "port":
             self.target_entry.configure(placeholder_text="127.0.0.1:5678")
-            self.help_label.configure(text="port = wait until host:port accepts a TCP connection")
+            self.help_label.configure(
+                text="port = wait until host:port accepts a TCP connection"
+            )
         elif readiness_type == "url":
             self.target_entry.configure(placeholder_text="http://127.0.0.1:3000")
-            self.help_label.configure(text="url = wait until the URL returns an HTTP 2xx or 3xx response")
+            self.help_label.configure(
+                text="url = wait until the URL returns an HTTP 2xx or 3xx response"
+            )
         else:
             self.target_entry.configure(placeholder_text="optional target")
-            self.help_label.configure(text="none = no readiness check; only delay_after is used")
-        self.target_entry.configure(state="normal" if readiness_type != "none" else "disabled")
+            self.help_label.configure(
+                text="none = no readiness check; only delay_after is used"
+            )
+        self.target_entry.configure(
+            state="normal" if readiness_type != "none" else "disabled"
+        )
 
     def add_preset(self) -> None:
         self.presets.append(
@@ -2102,7 +2338,9 @@ class ReadinessPresetsDialog(ctk.CTkToplevel):
         for preset in self.presets:
             normalized = normalize_readiness_preset(preset)
             if not normalized["name"]:
-                messagebox.showerror("Invalid Preset", "Each readiness preset must have a name.")
+                messagebox.showerror(
+                    "Invalid Preset", "Each readiness preset must have a name."
+                )
                 return
             lowered_name = normalized["name"].lower()
             if lowered_name in seen_names:
@@ -2143,7 +2381,12 @@ class ReadinessPresetsDialog(ctk.CTkToplevel):
 
 
 class BootManagerApp(ctk.CTk):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        startup_invocation: bool = False,
+        startup_auto_close: bool = False,
+    ) -> None:
         super().__init__()
 
         ensure_runtime_paths()
@@ -2155,6 +2398,8 @@ class BootManagerApp(ctk.CTk):
             "version": 1,
             "auto_start_on_launch": False,
             "confirm_step_delete": True,
+            "heartbeat_enabled": True,
+            "heartbeat_interval_seconds": DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
             "readiness_presets": [],
             "selected_mode_id": None,
             "modes": [],
@@ -2172,14 +2417,28 @@ class BootManagerApp(ctk.CTk):
         self.mode_buttons: list[ctk.CTkButton] = []
         self.mode_name_var = ctk.StringVar(value="")
         self.auto_start_var = ctk.BooleanVar(value=False)
+        self.heartbeat_enabled_var = ctk.BooleanVar(value=True)
         self.log_panel_state_var = ctk.StringVar(value="Compact")
         self.status_var = ctk.StringVar(value="Idle")
         self.run_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.health_queue: Queue[dict] = Queue()
+        self.heartbeat_thread: threading.Thread | None = None
+        self.heartbeat_stop_event = threading.Event()
+        self.heartbeat_wakeup_event = threading.Event()
+        self.heartbeat_snapshot_lock = threading.Lock()
+        self.heartbeat_mode_snapshot: dict | None = None
+        self.heartbeat_enabled_runtime = True
+        self.heartbeat_interval_runtime = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        self.step_health_states: dict[tuple[str, int], str] = {}
         self.is_running = False
         self.is_dirty = False
         self.editor_dirty = False
         self.is_shutting_down = False
+        self.startup_invocation = startup_invocation
+        self.startup_auto_close = startup_auto_close
+        self.startup_run_requested = False
+        self.startup_run_completed_successfully = False
         self.suspend_dirty_tracking = False
         self.launch_auto_start_scheduled = False
         self.pending_dirty_after_id: str | None = None
@@ -2191,6 +2450,7 @@ class BootManagerApp(ctk.CTk):
         self.step_detail_help_font = ctk.CTkFont(size=11)
 
         self.auto_start_var.trace_add("write", self.on_editor_changed)
+        self.heartbeat_enabled_var.trace_add("write", self.on_heartbeat_enabled_changed)
 
         self.title("AI Workstation Boot Manager")
         self.geometry("1440x860")
@@ -2210,11 +2470,21 @@ class BootManagerApp(ctk.CTk):
         self.build_ui()
         self.process_log_queue()
         self.process_status_queue()
+        self.process_health_queue()
+        self.start_heartbeat_monitoring()
 
         if self.config_valid and self.config_data["modes"]:
-            initial_index = self.find_mode_index_by_id(self.config_data.get("selected_mode_id"))
-            self.select_mode(initial_index if initial_index is not None else 0, force=True)
-            self.logger.info("Loaded %s startup modes from %s", len(self.config_data["modes"]), CONFIG_PATH)
+            initial_index = self.find_mode_index_by_id(
+                self.config_data.get("selected_mode_id")
+            )
+            self.select_mode(
+                initial_index if initial_index is not None else 0, force=True
+            )
+            self.logger.info(
+                "Loaded %s startup modes from %s",
+                len(self.config_data["modes"]),
+                CONFIG_PATH,
+            )
             self.set_status("Idle")
             self.schedule_auto_start_if_enabled()
         elif self.config_valid:
@@ -2244,7 +2514,9 @@ class BootManagerApp(ctk.CTk):
         sidebar_title.grid(row=0, column=0, padx=18, pady=(18, 8), sticky="w")
 
         self.mode_management_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.mode_management_frame.grid(row=1, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self.mode_management_frame.grid(
+            row=1, column=0, padx=14, pady=(0, 6), sticky="ew"
+        )
         self.mode_management_frame.grid_columnconfigure(0, weight=1)
 
         mode_management_label = ctk.CTkLabel(
@@ -2295,7 +2567,9 @@ class BootManagerApp(ctk.CTk):
         )
 
         self.mode_button_frame = ctk.CTkScrollableFrame(self.sidebar, width=180)
-        self.mode_button_frame.grid(row=2, column=0, padx=14, pady=(0, 14), sticky="nsew")
+        self.mode_button_frame.grid(
+            row=2, column=0, padx=14, pady=(0, 14), sticky="nsew"
+        )
         self.mode_button_frame.grid_columnconfigure(0, weight=1)
         self.tune_scrollable_frame(self.mode_button_frame, yscrollincrement=12)
 
@@ -2335,6 +2609,13 @@ class BootManagerApp(ctk.CTk):
             variable=self.auto_start_var,
         )
         self.auto_start_checkbox.grid(row=0, column=1, padx=(10, 0), sticky="e")
+
+        self.heartbeat_checkbox = ctk.CTkCheckBox(
+            self.mode_meta_row,
+            text="Enable heartbeat monitoring",
+            variable=self.heartbeat_enabled_var,
+        )
+        self.heartbeat_checkbox.grid(row=0, column=2, padx=(10, 0), sticky="e")
 
         self.editor_toolbar = ctk.CTkFrame(self.editor_header, fg_color="transparent")
         self.editor_toolbar.grid(row=2, column=0, pady=(4, 0), sticky="ew")
@@ -2405,7 +2686,9 @@ class BootManagerApp(ctk.CTk):
         )
         self.steps_frame.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="nsew")
         self.steps_frame.grid_columnconfigure(0, weight=1)
-        self.tune_scrollable_frame(self.steps_frame, yscrollincrement=STEPS_SCROLL_INCREMENT)
+        self.tune_scrollable_frame(
+            self.steps_frame, yscrollincrement=STEPS_SCROLL_INCREMENT
+        )
 
         self.log_frame = ctk.CTkFrame(self.main_panel)
         self.log_frame.grid(row=2, column=0, padx=16, pady=(0, 10), sticky="nsew")
@@ -2450,6 +2733,7 @@ class BootManagerApp(ctk.CTk):
             self.editor_title.configure(text="Config Load Failed")
             self.mode_name_entry.configure(state="disabled")
             self.auto_start_checkbox.configure(state="disabled")
+            self.heartbeat_checkbox.configure(state="disabled")
             self.render_disabled_state()
 
     def populate_sidebar(self) -> None:
@@ -2563,7 +2847,9 @@ class BootManagerApp(ctk.CTk):
             if config_ready and has_selection and self.selected_mode_index > 0
             else "disabled",
             "move_down": "normal"
-            if config_ready and has_selection and self.selected_mode_index < mode_count - 1
+            if config_ready
+            and has_selection
+            and self.selected_mode_index < mode_count - 1
             else "disabled",
         }
 
@@ -2592,7 +2878,10 @@ class BootManagerApp(ctk.CTk):
             return
 
         x = self.more_mode_actions_button.winfo_rootx()
-        y = self.more_mode_actions_button.winfo_rooty() + self.more_mode_actions_button.winfo_height()
+        y = (
+            self.more_mode_actions_button.winfo_rooty()
+            + self.more_mode_actions_button.winfo_height()
+        )
         try:
             self.mode_actions_menu.tk_popup(x, y)
         finally:
@@ -2649,7 +2938,9 @@ class BootManagerApp(ctk.CTk):
             return True
         if not self.should_sync_editor_state():
             return True
-        return self.sync_selected_mode_from_widgets(show_dialog=show_dialog, reason=reason)
+        return self.sync_selected_mode_from_widgets(
+            show_dialog=show_dialog, reason=reason
+        )
 
     def commit_editor_values_if_needed(
         self,
@@ -2661,7 +2952,9 @@ class BootManagerApp(ctk.CTk):
         commit_needed = self.should_sync_editor_state()
         if not commit_needed:
             return True
-        if not self.sync_selected_mode_from_widgets(show_dialog=show_dialog, reason=reason):
+        if not self.sync_selected_mode_from_widgets(
+            show_dialog=show_dialog, reason=reason
+        ):
             return False
         if success_status:
             self.set_status(success_status)
@@ -2686,7 +2979,9 @@ class BootManagerApp(ctk.CTk):
 
         bounded_index = max(0, min(index, len(self.config_data["modes"]) - 1))
         self.selected_mode_index = bounded_index
-        self.config_data["selected_mode_id"] = self.config_data["modes"][bounded_index]["id"]
+        self.config_data["selected_mode_id"] = self.config_data["modes"][bounded_index][
+            "id"
+        ]
         self.populate_sidebar()
         self.render_selected_mode()
 
@@ -2761,7 +3056,10 @@ class BootManagerApp(ctk.CTk):
 
         modes = self.config_data["modes"]
         moved_mode_name = modes[current_index]["name"]
-        modes[current_index], modes[target_index] = modes[target_index], modes[current_index]
+        modes[current_index], modes[target_index] = (
+            modes[target_index],
+            modes[current_index],
+        )
         self.select_mode_after_sidebar_change(target_index)
         self.set_dirty(True)
         self.set_status(f"Moved mode: {moved_mode_name}")
@@ -2794,6 +3092,28 @@ class BootManagerApp(ctk.CTk):
         self.set_dirty(True)
         self.editor_dirty = True
 
+    def get_active_readiness_preset_name(
+        self,
+        readiness_type: str,
+        readiness_target: str,
+        readiness_timeout_text: str,
+    ) -> str:
+        timeout_text = readiness_timeout_text.strip()
+        try:
+            timeout_value = int(timeout_text)
+        except (TypeError, ValueError):
+            return "Custom"
+
+        for preset in self.config_data.get("readiness_presets", []):
+            normalized_preset = normalize_readiness_preset(preset)
+            if (
+                str(normalized_preset["type"]) == readiness_type.strip()
+                and str(normalized_preset["target"]) == readiness_target.strip()
+                and int(normalized_preset["timeout_seconds"]) == timeout_value
+            ):
+                return str(normalized_preset["name"])
+        return "Custom"
+
     def open_readiness_preset_menu(
         self,
         anchor_widget: ctk.CTkButton,
@@ -2807,11 +3127,13 @@ class BootManagerApp(ctk.CTk):
             for preset in presets:
                 menu.add_command(
                     label=preset["name"],
-                    command=lambda value=copy.deepcopy(preset): self.apply_readiness_preset(
-                        readiness_type_var,
-                        readiness_target_var,
-                        readiness_timeout_var,
-                        value,
+                    command=lambda value=copy.deepcopy(preset): (
+                        self.apply_readiness_preset(
+                            readiness_type_var,
+                            readiness_target_var,
+                            readiness_timeout_var,
+                            value,
+                        )
                     ),
                 )
         else:
@@ -2836,6 +3158,8 @@ class BootManagerApp(ctk.CTk):
             "args": [],
             "delay_after": 0,
             "enabled": True,
+            "launch_method": "normal",
+            "scheduled_task_name": "",
             "readiness": make_default_readiness(),
             "process_ready": make_default_process_ready(),
             "window_snap": make_default_window_snap(),
@@ -2902,7 +3226,10 @@ class BootManagerApp(ctk.CTk):
         del mode["steps"][step_index]
         if self.expanded_step_index == step_index:
             self.expanded_step_index = None
-        elif self.expanded_step_index is not None and step_index < self.expanded_step_index:
+        elif (
+            self.expanded_step_index is not None
+            and step_index < self.expanded_step_index
+        ):
             self.expanded_step_index -= 1
         self.render_selected_mode()
         self.set_dirty(True)
@@ -2962,13 +3289,17 @@ class BootManagerApp(ctk.CTk):
 
         dragged_index = self.dragged_step_index
         target_index = (
-            self.drag_drop_index if self.drag_drop_index is not None else self.dragged_step_index
+            self.drag_drop_index
+            if self.drag_drop_index is not None
+            else self.dragged_step_index
         )
         self.clear_step_drag_feedback()
 
         if target_index is None:
             return
-        if not self.sync_selected_mode_if_needed(show_dialog=True, reason="drag_finish"):
+        if not self.sync_selected_mode_if_needed(
+            show_dialog=True, reason="drag_finish"
+        ):
             return
         self.reorder_step_to_slot(dragged_index, target_index)
         self.log_perf(
@@ -2978,7 +3309,10 @@ class BootManagerApp(ctk.CTk):
         )
 
     def clear_step_drag_feedback(self) -> None:
-        if self.drag_highlight_card is not None and self.drag_highlight_card.winfo_exists():
+        if (
+            self.drag_highlight_card is not None
+            and self.drag_highlight_card.winfo_exists()
+        ):
             self.drag_highlight_card.configure(border_width=0)
         if self.drag_indicator is not None and self.drag_indicator.winfo_exists():
             self.drag_indicator.place_forget()
@@ -2992,7 +3326,10 @@ class BootManagerApp(ctk.CTk):
         if self.dragged_step_index is None or self.drag_drop_index is None:
             return
 
-        if self.drag_highlight_card is not None and self.drag_highlight_card.winfo_exists():
+        if (
+            self.drag_highlight_card is not None
+            and self.drag_highlight_card.winfo_exists()
+        ):
             self.drag_highlight_card.configure(border_width=0)
 
         if 0 <= self.dragged_step_index < len(self.rendered_step_cards):
@@ -3132,7 +3469,9 @@ class BootManagerApp(ctk.CTk):
                 self.after_cancel(self.pending_dirty_after_id)
             except TclError:
                 pass
-        self.pending_dirty_after_id = self.after(DIRTY_MARK_DELAY_MS, self.commit_pending_dirty_mark)
+        self.pending_dirty_after_id = self.after(
+            DIRTY_MARK_DELAY_MS, self.commit_pending_dirty_mark
+        )
 
     def commit_pending_dirty_mark(self) -> None:
         self.pending_dirty_after_id = None
@@ -3165,7 +3504,9 @@ class BootManagerApp(ctk.CTk):
         if (
             not force
             and self.selected_mode_index is not None
-            and not self.sync_selected_mode_if_needed(show_dialog=True, reason="mode_switch")
+            and not self.sync_selected_mode_if_needed(
+                show_dialog=True, reason="mode_switch"
+            )
         ):
             return
 
@@ -3176,7 +3517,9 @@ class BootManagerApp(ctk.CTk):
             self.expanded_step_index = None
         self.render_selected_mode()
         if not self.is_running:
-            self.set_status(f"Selected mode: {self.config_data['modes'][index]['name']}")
+            self.set_status(
+                f"Selected mode: {self.config_data['modes'][index]['name']}"
+            )
         if selection_changed and not force:
             self.set_dirty(True)
         self.log_perf("select_mode", started_at, f"index={index}")
@@ -3195,9 +3538,15 @@ class BootManagerApp(ctk.CTk):
         if self.selected_mode_index is None:
             self.editor_title.configure(text="Selected Mode")
             self.mode_name_var.set("")
-            self.auto_start_var.set(bool(self.config_data.get("auto_start_on_launch", False)))
+            self.auto_start_var.set(
+                bool(self.config_data.get("auto_start_on_launch", False))
+            )
+            self.heartbeat_enabled_var.set(
+                bool(self.config_data.get("heartbeat_enabled", True))
+            )
             self.mode_name_entry.configure(state="disabled")
             self.auto_start_checkbox.configure(state="disabled")
+            self.heartbeat_checkbox.configure(state="disabled")
             empty_message = ctk.CTkLabel(
                 self.steps_frame,
                 text="No mode is selected. Use Add Mode in the sidebar to create one.",
@@ -3208,6 +3557,7 @@ class BootManagerApp(ctk.CTk):
             empty_message.grid(row=0, column=0, padx=18, pady=18, sticky="w")
             self.suspend_dirty_tracking = False
             self.editor_dirty = False
+            self.refresh_heartbeat_snapshot()
             self.refresh_action_states()
             self.log_perf("render_selected_mode", started_at, "steps=0 selected=none")
             return
@@ -3228,13 +3578,21 @@ class BootManagerApp(ctk.CTk):
 
         mode = self.config_data["modes"][self.selected_mode_index]
         step_count = len(mode["steps"])
-        if self.expanded_step_index is not None and self.expanded_step_index >= len(mode["steps"]):
+        if self.expanded_step_index is not None and self.expanded_step_index >= len(
+            mode["steps"]
+        ):
             self.expanded_step_index = None
         self.editor_title.configure(text="Selected Mode")
         self.mode_name_entry.configure(state="normal")
         self.auto_start_checkbox.configure(state="normal")
+        self.heartbeat_checkbox.configure(state="normal")
         self.mode_name_var.set(mode["name"])
-        self.auto_start_var.set(bool(self.config_data.get("auto_start_on_launch", False)))
+        self.auto_start_var.set(
+            bool(self.config_data.get("auto_start_on_launch", False))
+        )
+        self.heartbeat_enabled_var.set(
+            bool(self.config_data.get("heartbeat_enabled", True))
+        )
 
         if not mode["steps"]:
             empty_steps_label = ctk.CTkLabel(
@@ -3259,6 +3617,7 @@ class BootManagerApp(ctk.CTk):
             card.grid_columnconfigure(3, weight=0)
             card.grid_columnconfigure(4, weight=0)
             card.grid_columnconfigure(5, weight=0)
+            card.grid_columnconfigure(6, weight=0)
 
             name_var = ctk.StringVar(value=step["name"])
             type_var = ctk.StringVar(value=step["type"])
@@ -3266,6 +3625,16 @@ class BootManagerApp(ctk.CTk):
             args_var = ctk.StringVar(value=args_to_text(step["args"]))
             delay_var = ctk.StringVar(value=str(step["delay_after"]))
             enabled_var = ctk.BooleanVar(value=step["enabled"])
+            launch_method = normalize_launch_method(
+                step.get("launch_method"),
+                legacy_run_as_admin=normalize_run_as_admin(step.get("run_as_admin")),
+            )
+            launch_method_var = ctk.StringVar(
+                value=get_launch_method_label(launch_method)
+            )
+            scheduled_task_name_var = ctk.StringVar(
+                value=str(step.get("scheduled_task_name", "")).strip()
+            )
             readiness = normalize_readiness_config(step.get("readiness"))
             process_ready = normalize_process_ready_config(
                 step.get("process_ready"),
@@ -3274,7 +3643,9 @@ class BootManagerApp(ctk.CTk):
             )
             readiness_type_var = ctk.StringVar(value=readiness["type"])
             readiness_target_var = ctk.StringVar(value=readiness["target"])
-            readiness_timeout_var = ctk.StringVar(value=str(readiness["timeout_seconds"]))
+            readiness_timeout_var = ctk.StringVar(
+                value=str(readiness["timeout_seconds"])
+            )
             process_ready_enabled_var = ctk.BooleanVar(value=process_ready["enabled"])
             process_ready_name_var = ctk.StringVar(value=process_ready["name"])
             process_ready_timeout_var = ctk.StringVar(
@@ -3286,7 +3657,9 @@ class BootManagerApp(ctk.CTk):
             window_snap = normalize_window_snap_config(step.get("window_snap"))
             snap_enabled_var = ctk.BooleanVar(value=window_snap["snap_enabled"])
             snap_match_mode_var = ctk.StringVar(value=window_snap["window_match_mode"])
-            snap_match_value_var = ctk.StringVar(value=window_snap["window_match_value"])
+            snap_match_value_var = ctk.StringVar(
+                value=window_snap["window_match_value"]
+            )
             snap_x_var = ctk.StringVar(value=str(window_snap["snap_x"]))
             snap_y_var = ctk.StringVar(value=str(window_snap["snap_y"]))
             snap_width_var = ctk.StringVar(value=str(window_snap["snap_width"]))
@@ -3294,6 +3667,7 @@ class BootManagerApp(ctk.CTk):
             snap_timeout_var = ctk.StringVar(value=str(window_snap["snap_timeout_sec"]))
             type_var.trace_add("write", self.on_editor_changed)
             enabled_var.trace_add("write", self.on_editor_changed)
+            launch_method_var.trace_add("write", self.on_editor_changed)
             readiness_type_var.trace_add("write", self.on_editor_changed)
             process_ready_enabled_var.trace_add("write", self.on_editor_changed)
             snap_enabled_var.trace_add("write", self.on_editor_changed)
@@ -3309,7 +3683,9 @@ class BootManagerApp(ctk.CTk):
                 hover_color=("gray70", "gray30"),
                 text_color=("gray20", "gray88"),
                 cursor="fleur",
-                state="normal" if self.config_valid and not self.is_running else "disabled",
+                state="normal"
+                if self.config_valid and not self.is_running
+                else "disabled",
             )
             drag_handle.grid(
                 row=0,
@@ -3354,9 +3730,21 @@ class BootManagerApp(ctk.CTk):
             )
 
             enabled_text = "Enabled" if enabled_var.get() else "Disabled"
+            summary_launch_method = normalize_launch_method(
+                step.get("launch_method"),
+                legacy_run_as_admin=normalize_run_as_admin(step.get("run_as_admin")),
+            )
+            launch_summary_text = (
+                ""
+                if summary_launch_method == "normal"
+                else f"  |  {get_launch_method_label(summary_launch_method)}"
+            )
             summary_meta = ctk.CTkLabel(
                 card,
-                text=f"{type_var.get().upper()}  |  Delay {delay_var.get() or '0'}s  |  {enabled_text}",
+                text=(
+                    f"{type_var.get().upper()}  |  Delay {delay_var.get() or '0'}s  |  "
+                    f"{enabled_text}{launch_summary_text}"
+                ),
                 anchor="w",
                 font=self.step_meta_font,
             )
@@ -3366,6 +3754,28 @@ class BootManagerApp(ctk.CTk):
                 padx=STEP_CARD_INNER_PADX,
                 pady=(STEP_CARD_TOP_PADY, 5),
                 sticky="ew",
+            )
+
+            health_key = self.make_step_health_key(mode["id"], step_index - 1)
+            health_badge = ctk.CTkLabel(
+                card,
+                text="Unknown",
+                width=88,
+                corner_radius=6,
+                padx=8,
+                pady=2,
+                font=self.step_detail_help_font,
+            )
+            health_badge.grid(
+                row=0,
+                column=4,
+                padx=(0, 6),
+                pady=(STEP_CARD_TOP_PADY, 5),
+                sticky="e",
+            )
+            self.configure_health_badge(
+                health_badge,
+                self.step_health_states.get(health_key, HEARTBEAT_UNKNOWN),
             )
 
             toggle_button = ctk.CTkButton(
@@ -3378,7 +3788,7 @@ class BootManagerApp(ctk.CTk):
             )
             toggle_button.grid(
                 row=0,
-                column=4,
+                column=5,
                 padx=(0, 6),
                 pady=(STEP_CARD_TOP_PADY, 5),
                 sticky="e",
@@ -3392,12 +3802,14 @@ class BootManagerApp(ctk.CTk):
                 font=self.step_button_font,
                 fg_color="#b34141",
                 hover_color="#943333",
-                state="normal" if self.config_valid and not self.is_running else "disabled",
+                state="normal"
+                if self.config_valid and not self.is_running
+                else "disabled",
                 command=lambda idx=step_index - 1: self.delete_step(idx),
             )
             remove_button.grid(
                 row=0,
-                column=5,
+                column=6,
                 padx=(0, STEP_CARD_INNER_PADX),
                 pady=(STEP_CARD_TOP_PADY, 5),
                 sticky="e",
@@ -3408,7 +3820,7 @@ class BootManagerApp(ctk.CTk):
                 detail_frame.grid(
                     row=1,
                     column=0,
-                    columnspan=6,
+                    columnspan=7,
                     padx=STEP_CARD_INNER_PADX,
                     pady=(0, 6),
                     sticky="ew",
@@ -3417,6 +3829,7 @@ class BootManagerApp(ctk.CTk):
                 detail_frame.grid_columnconfigure(1, weight=0)
                 detail_frame.grid_columnconfigure(2, weight=0)
                 detail_frame.grid_columnconfigure(3, weight=0)
+                detail_frame.grid_columnconfigure(4, weight=0)
 
                 detail_name_label = ctk.CTkLabel(
                     detail_frame,
@@ -3424,7 +3837,9 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                detail_name_label.grid(row=0, column=0, padx=(0, 8), pady=(0, 2), sticky="w")
+                detail_name_label.grid(
+                    row=0, column=0, padx=(0, 8), pady=(0, 2), sticky="w"
+                )
 
                 detail_type_label = ctk.CTkLabel(
                     detail_frame,
@@ -3432,7 +3847,9 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                detail_type_label.grid(row=0, column=1, padx=(0, 8), pady=(0, 2), sticky="w")
+                detail_type_label.grid(
+                    row=0, column=1, padx=(0, 8), pady=(0, 2), sticky="w"
+                )
 
                 detail_delay_label = ctk.CTkLabel(
                     detail_frame,
@@ -3440,7 +3857,9 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                detail_delay_label.grid(row=0, column=2, padx=(0, 8), pady=(0, 2), sticky="w")
+                detail_delay_label.grid(
+                    row=0, column=2, padx=(0, 8), pady=(0, 2), sticky="w"
+                )
 
                 detail_enabled_label = ctk.CTkLabel(
                     detail_frame,
@@ -3449,6 +3868,14 @@ class BootManagerApp(ctk.CTk):
                     text_color=("gray35", "gray70"),
                 )
                 detail_enabled_label.grid(row=0, column=3, pady=(0, 2), sticky="w")
+
+                detail_launch_label = ctk.CTkLabel(
+                    detail_frame,
+                    text="Launch",
+                    font=self.step_detail_label_font,
+                    text_color=("gray35", "gray70"),
+                )
+                detail_launch_label.grid(row=0, column=4, pady=(0, 2), sticky="w")
 
                 name_entry = ctk.CTkEntry(
                     detail_frame,
@@ -3479,8 +3906,55 @@ class BootManagerApp(ctk.CTk):
                 delay_entry.grid(row=1, column=2, padx=(0, 8), pady=(0, 6), sticky="ew")
                 self.bind_text_dirty_tracking(delay_entry)
 
-                enabled_checkbox = ctk.CTkCheckBox(detail_frame, text="", variable=enabled_var, width=24)
+                enabled_checkbox = ctk.CTkCheckBox(
+                    detail_frame, text="", variable=enabled_var, width=24
+                )
                 enabled_checkbox.grid(row=1, column=3, pady=(0, 6), sticky="w")
+
+                launch_method_menu = ctk.CTkOptionMenu(
+                    detail_frame,
+                    variable=launch_method_var,
+                    values=[get_launch_method_label(value) for value in LAUNCH_METHODS],
+                    width=156,
+                    height=STEP_ENTRY_HEIGHT,
+                    font=self.step_button_font,
+                    dropdown_font=self.step_button_font,
+                    dynamic_resizing=False,
+                )
+                launch_method_menu.grid(
+                    row=1, column=4, padx=(8, 0), pady=(0, 6), sticky="w"
+                )
+
+                scheduled_task_name_label = ctk.CTkLabel(
+                    detail_frame,
+                    text="Task name",
+                    font=self.step_detail_label_font,
+                    text_color=("gray35", "gray70"),
+                )
+                scheduled_task_name_label.grid(
+                    row=2,
+                    column=0,
+                    columnspan=4,
+                    padx=(0, 8),
+                    pady=(0, 2),
+                    sticky="w",
+                )
+
+                scheduled_task_name_entry = ctk.CTkEntry(
+                    detail_frame,
+                    textvariable=scheduled_task_name_var,
+                    height=STEP_ENTRY_HEIGHT,
+                    placeholder_text="Existing Windows Task Scheduler task name",
+                )
+                scheduled_task_name_entry.grid(
+                    row=3,
+                    column=0,
+                    columnspan=4,
+                    padx=(0, 8),
+                    pady=(0, 6),
+                    sticky="ew",
+                )
+                self.bind_text_dirty_tracking(scheduled_task_name_entry)
 
                 path_label = ctk.CTkLabel(
                     detail_frame,
@@ -3488,7 +3962,9 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                path_label.grid(row=2, column=0, columnspan=3, padx=(0, 8), pady=(0, 2), sticky="w")
+                path_label.grid(
+                    row=4, column=0, columnspan=3, padx=(0, 8), pady=(0, 2), sticky="w"
+                )
 
                 path_entry = ctk.CTkEntry(
                     detail_frame,
@@ -3496,7 +3972,9 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text="Path or URL",
                 )
-                path_entry.grid(row=3, column=0, columnspan=3, padx=(0, 8), pady=(0, 6), sticky="ew")
+                path_entry.grid(
+                    row=5, column=0, columnspan=3, padx=(0, 8), pady=(0, 6), sticky="ew"
+                )
                 self.bind_text_dirty_tracking(path_entry)
 
                 browse_button = ctk.CTkButton(
@@ -3507,7 +3985,7 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_button_font,
                     command=lambda value=path_var: self.browse_for_step_path(value),
                 )
-                browse_button.grid(row=3, column=3, pady=(0, 6), sticky="e")
+                browse_button.grid(row=5, column=3, pady=(0, 6), sticky="e")
 
                 args_label = ctk.CTkLabel(
                     detail_frame,
@@ -3515,7 +3993,7 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                args_label.grid(row=4, column=0, columnspan=4, pady=(0, 2), sticky="w")
+                args_label.grid(row=6, column=0, columnspan=4, pady=(0, 2), sticky="w")
 
                 args_entry = ctk.CTkEntry(
                     detail_frame,
@@ -3523,7 +4001,7 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text='Example: --profile-directory="Profile 1"',
                 )
-                args_entry.grid(row=5, column=0, columnspan=4, pady=(0, 2), sticky="ew")
+                args_entry.grid(row=7, column=0, columnspan=4, pady=(0, 2), sticky="ew")
                 self.bind_text_dirty_tracking(args_entry)
 
                 args_help = ctk.CTkLabel(
@@ -3532,31 +4010,35 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_detail_help_font,
                     text_color=("gray35", "gray70"),
                 )
-                args_help.grid(row=6, column=0, columnspan=4, pady=(0, 2), sticky="w")
+                args_help.grid(row=8, column=0, columnspan=4, pady=(0, 2), sticky="w")
 
                 readiness_label = ctk.CTkLabel(
                     detail_frame,
-                    text="Readiness",
+                    text="Wait Until Ready",
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                readiness_label.grid(row=7, column=0, padx=(0, 8), pady=(2, 1), sticky="w")
+                readiness_label.grid(
+                    row=9, column=0, padx=(0, 8), pady=(2, 1), sticky="w"
+                )
 
                 readiness_target_label = ctk.CTkLabel(
                     detail_frame,
-                    text="Target",
+                    text="What to check",
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                readiness_target_label.grid(row=7, column=1, columnspan=2, padx=(0, 8), pady=(2, 1), sticky="w")
+                readiness_target_label.grid(
+                    row=9, column=1, columnspan=2, padx=(0, 8), pady=(2, 1), sticky="w"
+                )
 
                 readiness_timeout_label = ctk.CTkLabel(
                     detail_frame,
-                    text="Timeout",
+                    text="Wait up to (s)",
                     font=self.step_detail_label_font,
                     text_color=("gray35", "gray70"),
                 )
-                readiness_timeout_label.grid(row=7, column=3, pady=(2, 1), sticky="w")
+                readiness_timeout_label.grid(row=9, column=3, pady=(2, 1), sticky="w")
 
                 readiness_type_menu = ctk.CTkSegmentedButton(
                     detail_frame,
@@ -3566,7 +4048,9 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_button_font,
                     dynamic_resizing=False,
                 )
-                readiness_type_menu.grid(row=8, column=0, padx=(0, 8), pady=(0, 4), sticky="ew")
+                readiness_type_menu.grid(
+                    row=10, column=0, padx=(0, 8), pady=(0, 4), sticky="ew"
+                )
 
                 readiness_target_entry = ctk.CTkEntry(
                     detail_frame,
@@ -3574,7 +4058,10 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text="host:port or URL",
                 )
-                readiness_target_entry.grid(row=8, column=1, columnspan=2, padx=(0, 8), pady=(0, 4), sticky="ew")
+                readiness_target_entry.grid(
+                    row=8, column=1, columnspan=2, padx=(0, 8), pady=(0, 4), sticky="ew"
+                )
+                readiness_target_entry.grid_configure(row=10)
                 self.bind_text_dirty_tracking(readiness_target_entry)
 
                 readiness_timeout_entry = ctk.CTkEntry(
@@ -3584,27 +4071,68 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text="60",
                 )
-                readiness_timeout_entry.grid(row=8, column=3, pady=(0, 4), sticky="ew")
+                readiness_timeout_entry.grid(row=10, column=3, pady=(0, 4), sticky="ew")
                 self.bind_text_dirty_tracking(readiness_timeout_entry)
 
                 readiness_help = ctk.CTkLabel(
                     detail_frame,
-                    text="none = delay only | port = host:port accepts TCP | url = HTTP responds",
+                    text="none = rely on Delay only | port = for local services | url = for web apps",
                     font=self.step_detail_help_font,
                     text_color=("gray35", "gray70"),
                 )
-                readiness_help.grid(row=9, column=0, columnspan=4, pady=(0, 2), sticky="w")
+                readiness_help.grid(
+                    row=11, column=0, columnspan=4, pady=(0, 2), sticky="w"
+                )
 
-                process_ready_header = ctk.CTkFrame(detail_frame, fg_color="transparent")
-                process_ready_header.grid(row=10, column=0, columnspan=4, pady=(0, 2), sticky="ew")
+                process_ready_header = ctk.CTkFrame(
+                    detail_frame, fg_color="transparent"
+                )
+                process_ready_header.grid(
+                    row=12, column=0, columnspan=4, pady=(0, 2), sticky="ew"
+                )
+                process_ready_header.grid_columnconfigure(0, weight=0)
                 process_ready_header.grid_columnconfigure(1, weight=1)
+                process_ready_header.grid_columnconfigure(2, weight=0)
+                process_ready_header.grid_columnconfigure(3, weight=0)
 
                 process_ready_checkbox = ctk.CTkCheckBox(
                     process_ready_header,
-                    text="Process Ready",
+                    text="Wait for process",
                     variable=process_ready_enabled_var,
                 )
-                process_ready_checkbox.grid(row=0, column=0, padx=(0, 8), sticky="w")
+                process_ready_checkbox.grid(
+                    row=0, column=0, columnspan=4, padx=(0, 8), sticky="w"
+                )
+
+                process_ready_name_label = ctk.CTkLabel(
+                    process_ready_header,
+                    text="Process name",
+                    font=self.step_detail_label_font,
+                    text_color=("gray35", "gray70"),
+                )
+                process_ready_name_label.grid(
+                    row=1, column=1, padx=(0, 8), pady=(2, 1), sticky="w"
+                )
+
+                process_ready_timeout_label = ctk.CTkLabel(
+                    process_ready_header,
+                    text="Wait up to (s)",
+                    font=self.step_detail_label_font,
+                    text_color=("gray35", "gray70"),
+                )
+                process_ready_timeout_label.grid(
+                    row=1, column=2, padx=(0, 8), pady=(2, 1), sticky="w"
+                )
+
+                process_settle_delay_label = ctk.CTkLabel(
+                    process_ready_header,
+                    text="Extra settle (s)",
+                    font=self.step_detail_label_font,
+                    text_color=("gray35", "gray70"),
+                )
+                process_settle_delay_label.grid(
+                    row=1, column=3, pady=(2, 1), sticky="w"
+                )
 
                 process_ready_name_entry = ctk.CTkEntry(
                     process_ready_header,
@@ -3612,7 +4140,7 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text="tailscale-ipn.exe",
                 )
-                process_ready_name_entry.grid(row=0, column=1, padx=(0, 8), sticky="ew")
+                process_ready_name_entry.grid(row=2, column=1, padx=(0, 8), sticky="ew")
                 self.bind_text_dirty_tracking(process_ready_name_entry)
 
                 process_ready_timeout_entry = ctk.CTkEntry(
@@ -3622,7 +4150,9 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text="30",
                 )
-                process_ready_timeout_entry.grid(row=0, column=2, padx=(0, 8), sticky="w")
+                process_ready_timeout_entry.grid(
+                    row=2, column=2, padx=(0, 8), sticky="w"
+                )
                 self.bind_text_dirty_tracking(process_ready_timeout_entry)
 
                 process_settle_delay_entry = ctk.CTkEntry(
@@ -3632,27 +4162,53 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text="0",
                 )
-                process_settle_delay_entry.grid(row=0, column=3, sticky="w")
+                process_settle_delay_entry.grid(row=2, column=3, sticky="w")
                 self.bind_text_dirty_tracking(process_settle_delay_entry)
 
                 process_ready_help = ctk.CTkLabel(
                     detail_frame,
-                    text="Optional for tray/background apps: wait for a process name, then optionally settle before the next step.",
+                    text="Use this for tray/background apps like tailscale-ipn.exe that do not expose a port or URL.",
                     font=self.step_detail_help_font,
                     text_color=("gray35", "gray70"),
                 )
-                process_ready_help.grid(row=11, column=0, columnspan=4, pady=(0, 2), sticky="w")
+                process_ready_help.grid(
+                    row=13, column=0, columnspan=4, pady=(0, 2), sticky="w"
+                )
 
                 snap_header = ctk.CTkFrame(detail_frame, fg_color="transparent")
-                snap_header.grid(row=12, column=0, columnspan=4, pady=(0, 2), sticky="ew")
+                snap_header.grid(
+                    row=14, column=0, columnspan=4, pady=(0, 2), sticky="ew"
+                )
+                snap_header.grid_columnconfigure(0, weight=0)
+                snap_header.grid_columnconfigure(1, weight=0)
                 snap_header.grid_columnconfigure(2, weight=1)
 
                 snap_enabled_checkbox = ctk.CTkCheckBox(
                     snap_header,
-                    text="Snap Window",
+                    text="Position window after launch",
                     variable=snap_enabled_var,
                 )
-                snap_enabled_checkbox.grid(row=0, column=0, padx=(0, 8), sticky="w")
+                snap_enabled_checkbox.grid(
+                    row=0, column=0, columnspan=3, padx=(0, 8), sticky="w"
+                )
+
+                snap_match_mode_label = ctk.CTkLabel(
+                    snap_header,
+                    text="Match by",
+                    font=self.step_detail_label_font,
+                    text_color=("gray35", "gray70"),
+                )
+                snap_match_mode_label.grid(
+                    row=1, column=1, padx=(0, 8), pady=(2, 1), sticky="w"
+                )
+
+                snap_match_value_label = ctk.CTkLabel(
+                    snap_header,
+                    text="Window title / process",
+                    font=self.step_detail_label_font,
+                    text_color=("gray35", "gray70"),
+                )
+                snap_match_value_label.grid(row=1, column=2, pady=(2, 1), sticky="w")
 
                 snap_match_mode_menu = ctk.CTkSegmentedButton(
                     snap_header,
@@ -3663,7 +4219,7 @@ class BootManagerApp(ctk.CTk):
                     font=self.step_detail_help_font,
                     dynamic_resizing=False,
                 )
-                snap_match_mode_menu.grid(row=0, column=1, padx=(0, 8), sticky="w")
+                snap_match_mode_menu.grid(row=2, column=1, padx=(0, 8), sticky="w")
 
                 snap_match_value_entry = ctk.CTkEntry(
                     snap_header,
@@ -3671,11 +4227,13 @@ class BootManagerApp(ctk.CTk):
                     height=STEP_ENTRY_HEIGHT,
                     placeholder_text="window title text or process name",
                 )
-                snap_match_value_entry.grid(row=0, column=2, sticky="ew")
+                snap_match_value_entry.grid(row=2, column=2, sticky="ew")
                 self.bind_text_dirty_tracking(snap_match_value_entry)
 
                 snap_geometry_frame = ctk.CTkFrame(detail_frame, fg_color="transparent")
-                snap_geometry_frame.grid(row=13, column=0, columnspan=4, pady=(0, 2), sticky="ew")
+                snap_geometry_frame.grid(
+                    row=15, column=0, columnspan=4, pady=(0, 2), sticky="ew"
+                )
                 snap_geometry_frame.grid_columnconfigure(1, weight=0)
                 snap_geometry_frame.grid_columnconfigure(3, weight=0)
                 snap_geometry_frame.grid_columnconfigure(5, weight=0)
@@ -3683,7 +4241,13 @@ class BootManagerApp(ctk.CTk):
                 snap_geometry_frame.grid_columnconfigure(9, weight=0)
                 snap_geometry_frame.grid_columnconfigure(10, weight=1)
 
-                for label_text, column in (("X", 0), ("Y", 2), ("W", 4), ("H", 6), ("Timeout", 8)):
+                for label_text, column in (
+                    ("X", 0),
+                    ("Y", 2),
+                    ("W", 4),
+                    ("H", 6),
+                    ("Wait up to (s)", 8),
+                ):
                     label = ctk.CTkLabel(
                         snap_geometry_frame,
                         text=label_text,
@@ -3692,23 +4256,48 @@ class BootManagerApp(ctk.CTk):
                     )
                     label.grid(row=0, column=column, padx=(0, 4), sticky="w")
 
-                snap_x_entry = ctk.CTkEntry(snap_geometry_frame, textvariable=snap_x_var, width=62, height=STEP_ENTRY_HEIGHT)
+                snap_x_entry = ctk.CTkEntry(
+                    snap_geometry_frame,
+                    textvariable=snap_x_var,
+                    width=62,
+                    height=STEP_ENTRY_HEIGHT,
+                )
                 snap_x_entry.grid(row=0, column=1, padx=(0, 8), sticky="w")
                 self.bind_text_dirty_tracking(snap_x_entry)
 
-                snap_y_entry = ctk.CTkEntry(snap_geometry_frame, textvariable=snap_y_var, width=62, height=STEP_ENTRY_HEIGHT)
+                snap_y_entry = ctk.CTkEntry(
+                    snap_geometry_frame,
+                    textvariable=snap_y_var,
+                    width=62,
+                    height=STEP_ENTRY_HEIGHT,
+                )
                 snap_y_entry.grid(row=0, column=3, padx=(0, 8), sticky="w")
                 self.bind_text_dirty_tracking(snap_y_entry)
 
-                snap_width_entry = ctk.CTkEntry(snap_geometry_frame, textvariable=snap_width_var, width=72, height=STEP_ENTRY_HEIGHT)
+                snap_width_entry = ctk.CTkEntry(
+                    snap_geometry_frame,
+                    textvariable=snap_width_var,
+                    width=72,
+                    height=STEP_ENTRY_HEIGHT,
+                )
                 snap_width_entry.grid(row=0, column=5, padx=(0, 8), sticky="w")
                 self.bind_text_dirty_tracking(snap_width_entry)
 
-                snap_height_entry = ctk.CTkEntry(snap_geometry_frame, textvariable=snap_height_var, width=72, height=STEP_ENTRY_HEIGHT)
+                snap_height_entry = ctk.CTkEntry(
+                    snap_geometry_frame,
+                    textvariable=snap_height_var,
+                    width=72,
+                    height=STEP_ENTRY_HEIGHT,
+                )
                 snap_height_entry.grid(row=0, column=7, padx=(0, 8), sticky="w")
                 self.bind_text_dirty_tracking(snap_height_entry)
 
-                snap_timeout_entry = ctk.CTkEntry(snap_geometry_frame, textvariable=snap_timeout_var, width=72, height=STEP_ENTRY_HEIGHT)
+                snap_timeout_entry = ctk.CTkEntry(
+                    snap_geometry_frame,
+                    textvariable=snap_timeout_var,
+                    width=72,
+                    height=STEP_ENTRY_HEIGHT,
+                )
                 snap_timeout_entry.grid(row=0, column=9, padx=(0, 8), sticky="w")
                 self.bind_text_dirty_tracking(snap_timeout_entry)
 
@@ -3718,69 +4307,102 @@ class BootManagerApp(ctk.CTk):
                     width=144,
                     height=24,
                     font=self.step_detail_help_font,
-                    state="normal" if self.config_valid and not self.is_running else "disabled",
-                    command=lambda name_ref=name_var, step_type_ref=type_var, path_ref=path_var, enabled_ref=snap_enabled_var, mode_ref=snap_match_mode_var, value_ref=snap_match_value_var, x_ref=snap_x_var, y_ref=snap_y_var, w_ref=snap_width_var, h_ref=snap_height_var: self.capture_current_window_for_step(
-                        name_ref.get().strip() or "Step",
-                        step_type_ref.get(),
-                        path_ref,
-                        enabled_ref,
-                        mode_ref,
-                        value_ref,
-                        x_ref,
-                        y_ref,
-                        w_ref,
-                        h_ref,
+                    state="normal"
+                    if self.config_valid and not self.is_running
+                    else "disabled",
+                    command=lambda name_ref=name_var, step_type_ref=type_var, path_ref=path_var, enabled_ref=snap_enabled_var, mode_ref=snap_match_mode_var, value_ref=snap_match_value_var, x_ref=snap_x_var, y_ref=snap_y_var, w_ref=snap_width_var, h_ref=snap_height_var: (
+                        self.capture_current_window_for_step(
+                            name_ref.get().strip() or "Step",
+                            step_type_ref.get(),
+                            path_ref,
+                            enabled_ref,
+                            mode_ref,
+                            value_ref,
+                            x_ref,
+                            y_ref,
+                            w_ref,
+                            h_ref,
+                        )
                     ),
                 )
                 capture_window_button.grid(row=0, column=10, sticky="e")
 
                 snap_help = ctk.CTkLabel(
                     detail_frame,
-                    text="Optional: wait for a top-level window and move/resize it after launch.",
+                    text="Use this for normal visible app windows only, not tray apps.",
                     font=self.step_detail_help_font,
                     text_color=("gray35", "gray70"),
                 )
-                snap_help.grid(row=14, column=0, columnspan=4, pady=(0, 2), sticky="w")
+                snap_help.grid(row=16, column=0, columnspan=4, pady=(0, 2), sticky="w")
 
                 action_band = ctk.CTkFrame(detail_frame, fg_color="transparent")
-                action_band.grid(row=15, column=0, columnspan=4, pady=(0, 2), sticky="ew")
+                action_band.grid(
+                    row=17, column=0, columnspan=4, pady=(0, 2), sticky="ew"
+                )
                 action_band.grid_columnconfigure(3, weight=1)
 
                 presets_label = ctk.CTkLabel(
                     action_band,
-                    text="Preset",
+                    text="Ready check preset",
                     font=self.step_detail_help_font,
                     text_color=("gray35", "gray70"),
                 )
                 presets_label.grid(row=0, column=0, padx=(0, 6), sticky="w")
 
-                apply_preset_button = ctk.CTkButton(
-                    action_band,
-                    text="Apply",
-                    width=62,
-                    height=24,
-                    font=self.step_detail_help_font,
-                    command=lambda button_ref=None, rt=readiness_type_var, rg=readiness_target_var, to=readiness_timeout_var: None,
-                )
-                apply_preset_button.configure(
-                    command=lambda button_ref=apply_preset_button, rt=readiness_type_var, rg=readiness_target_var, to=readiness_timeout_var: self.open_readiness_preset_menu(
-                        button_ref,
-                        rt,
-                        rg,
-                        to,
-                    )
-                )
-                apply_preset_button.grid(row=0, column=1, padx=(0, 6), sticky="w")
-
                 manage_presets_button = ctk.CTkButton(
                     action_band,
-                    text="Manage",
-                    width=74,
+                    text="Manage Presets",
+                    width=124,
                     height=24,
                     font=self.step_detail_help_font,
                     command=self.open_readiness_presets_dialog,
                 )
-                manage_presets_button.grid(row=0, column=2, padx=(0, 12), sticky="w")
+                manage_presets_button.grid(row=0, column=1, padx=(0, 6), sticky="w")
+
+                apply_preset_button = ctk.CTkButton(
+                    action_band,
+                    text="Apply Preset",
+                    width=104,
+                    height=24,
+                    font=self.step_detail_help_font,
+                    command=lambda button_ref=None, rt=readiness_type_var, rg=readiness_target_var, to=readiness_timeout_var: (
+                        None
+                    ),
+                )
+                apply_preset_button.configure(
+                    command=lambda button_ref=apply_preset_button, rt=readiness_type_var, rg=readiness_target_var, to=readiness_timeout_var: (
+                        self.open_readiness_preset_menu(
+                            button_ref,
+                            rt,
+                            rg,
+                            to,
+                        )
+                    )
+                )
+                apply_preset_button.grid(row=0, column=2, padx=(0, 10), sticky="w")
+
+                active_preset_label = ctk.CTkLabel(
+                    action_band,
+                    text="Active: Custom",
+                    font=self.step_detail_help_font,
+                    text_color=("gray35", "gray70"),
+                )
+                active_preset_label.grid(row=0, column=3, padx=(0, 12), sticky="w")
+
+                def refresh_active_readiness_preset_label() -> None:
+                    active_preset_name = self.get_active_readiness_preset_name(
+                        readiness_type_var.get(),
+                        readiness_target_var.get(),
+                        readiness_timeout_var.get(),
+                    )
+                    active_preset_label.configure(text=f"Active: {active_preset_name}")
+
+                manage_presets_button.configure(
+                    command=lambda refresh_ref=refresh_active_readiness_preset_label: (
+                        self.open_readiness_presets_dialog(),
+                        refresh_ref(),
+                    )
+                )
 
                 duplicate_button = ctk.CTkButton(
                     action_band,
@@ -3788,7 +4410,9 @@ class BootManagerApp(ctk.CTk):
                     width=108,
                     height=24,
                     font=self.step_button_font,
-                    state="normal" if self.config_valid and not self.is_running else "disabled",
+                    state="normal"
+                    if self.config_valid and not self.is_running
+                    else "disabled",
                     command=lambda idx=step_index - 1: self.duplicate_step(idx),
                 )
                 duplicate_button.grid(row=0, column=6, sticky="e")
@@ -3813,7 +4437,9 @@ class BootManagerApp(ctk.CTk):
                     height=24,
                     font=self.step_button_font,
                     state="normal"
-                    if self.config_valid and not self.is_running and step_index < len(mode["steps"])
+                    if self.config_valid
+                    and not self.is_running
+                    and step_index < len(mode["steps"])
                     else "disabled",
                     command=lambda idx=step_index - 1: self.move_step(idx, 1),
                 )
@@ -3821,12 +4447,26 @@ class BootManagerApp(ctk.CTk):
 
                 def refresh_expanded_step_ui(*_args: object) -> None:
                     is_path_step = type_var.get() == "path"
+                    launch_method = get_launch_method_value_from_label(
+                        launch_method_var.get()
+                    )
                     readiness_type = readiness_type_var.get()
                     process_ready_enabled = bool(process_ready_enabled_var.get())
                     snap_enabled = bool(snap_enabled_var.get())
                     snap_match_mode = snap_match_mode_var.get()
                     path_label.configure(text="Path" if is_path_step else "URL")
-                    browse_button.configure(state="normal" if is_path_step else "disabled")
+                    browse_button.configure(
+                        state="normal" if is_path_step else "disabled"
+                    )
+                    launch_method_menu.configure(state="normal")
+                    if launch_method == "scheduled_task":
+                        scheduled_task_name_label.grid()
+                        scheduled_task_name_entry.grid()
+                        scheduled_task_name_entry.configure(state="normal")
+                    else:
+                        scheduled_task_name_entry.configure(state="disabled")
+                        scheduled_task_name_label.grid_remove()
+                        scheduled_task_name_entry.grid_remove()
                     readiness_target_entry.configure(
                         state="normal" if readiness_type != "none" else "disabled"
                     )
@@ -3834,23 +4474,24 @@ class BootManagerApp(ctk.CTk):
                         state="normal" if readiness_type != "none" else "disabled"
                     )
                     if readiness_type == "port":
-                        readiness_target_label.configure(text="Host:Port")
-                        readiness_target_entry.configure(placeholder_text="127.0.0.1:5678")
+                        readiness_target_entry.configure(
+                            placeholder_text="127.0.0.1:5678"
+                        )
                         readiness_help.configure(
-                            text="port = wait until host:port accepts a TCP connection"
+                            text="port = for local services that become ready on a host:port"
                         )
                     elif readiness_type == "url":
-                        readiness_target_label.configure(text="URL")
-                        readiness_target_entry.configure(placeholder_text="http://127.0.0.1:3000")
+                        readiness_target_entry.configure(
+                            placeholder_text="http://127.0.0.1:3000"
+                        )
                         readiness_help.configure(
-                            text="url = wait until the URL returns an HTTP 2xx or 3xx response"
+                            text="url = for web apps that become ready when an HTTP address responds"
                         )
                     else:
-                        readiness_target_label.configure(text="Target")
-                        readiness_target_entry.configure(placeholder_text="host:port or URL")
-                        readiness_help.configure(
-                            text="none = no readiness check; only delay_after is used"
+                        readiness_target_entry.configure(
+                            placeholder_text="host:port or URL"
                         )
+                        readiness_help.configure(text="none = rely on Delay only")
                     process_controls_enabled = process_ready_enabled and is_path_step
                     process_ready_checkbox.configure(
                         state="normal" if is_path_step else "disabled"
@@ -3866,15 +4507,19 @@ class BootManagerApp(ctk.CTk):
                     )
                     if is_path_step:
                         process_ready_help.configure(
-                            text="Optional for tray/background apps: wait for a process name, then optionally settle before the next step."
+                            text="Use this for tray/background apps like tailscale-ipn.exe that do not expose a port or URL."
                         )
                     else:
                         process_ready_help.configure(
-                            text="Process readiness is available for path steps only."
+                            text="Wait for process is available for path steps only."
                         )
                     snap_controls_enabled = snap_enabled and snap_match_mode != "none"
-                    snap_match_mode_menu.configure(state="normal" if snap_enabled else "disabled")
-                    snap_match_value_entry.configure(state="normal" if snap_controls_enabled else "disabled")
+                    snap_match_mode_menu.configure(
+                        state="normal" if snap_enabled else "disabled"
+                    )
+                    snap_match_value_entry.configure(
+                        state="normal" if snap_controls_enabled else "disabled"
+                    )
                     for entry in (
                         snap_x_entry,
                         snap_y_entry,
@@ -3882,28 +4527,40 @@ class BootManagerApp(ctk.CTk):
                         snap_height_entry,
                         snap_timeout_entry,
                     ):
-                        entry.configure(state="normal" if snap_controls_enabled else "disabled")
+                        entry.configure(
+                            state="normal" if snap_controls_enabled else "disabled"
+                        )
                     capture_window_button.configure(
-                        state="normal" if self.config_valid and not self.is_running else "disabled"
+                        state="normal"
+                        if self.config_valid and not self.is_running
+                        else "disabled"
                     )
                     if snap_match_mode == "title_contains":
-                        snap_match_value_entry.configure(placeholder_text="part of the window title")
+                        snap_match_value_entry.configure(
+                            placeholder_text="part of the window title"
+                        )
                         snap_help.configure(
-                            text="title_contains = first visible top-level window whose title contains the text"
+                            text="Use this for normal visible app windows only. title_contains looks for a visible window title that contains your text."
                         )
                     elif snap_match_mode == "process_name":
                         snap_match_value_entry.configure(placeholder_text="app.exe")
                         snap_help.configure(
-                            text="process_name = first visible top-level window whose process name matches"
+                            text="Use this for normal visible app windows only. process_name looks for a visible window owned by that app process."
                         )
                     else:
-                        snap_match_value_entry.configure(placeholder_text="window title text or process name")
-                        snap_help.configure(
-                            text="Optional: wait for a top-level window and move/resize it after launch."
+                        snap_match_value_entry.configure(
+                            placeholder_text="window title text or process name"
                         )
+                        snap_help.configure(
+                            text="Use this for normal visible app windows only, not tray apps."
+                        )
+                    refresh_active_readiness_preset_label()
 
                 type_var.trace_add("write", refresh_expanded_step_ui)
+                launch_method_var.trace_add("write", refresh_expanded_step_ui)
                 readiness_type_var.trace_add("write", refresh_expanded_step_ui)
+                readiness_target_var.trace_add("write", refresh_expanded_step_ui)
+                readiness_timeout_var.trace_add("write", refresh_expanded_step_ui)
                 process_ready_enabled_var.trace_add("write", refresh_expanded_step_ui)
                 snap_enabled_var.trace_add("write", refresh_expanded_step_ui)
                 snap_match_mode_var.trace_add("write", refresh_expanded_step_ui)
@@ -3917,6 +4574,8 @@ class BootManagerApp(ctk.CTk):
                     "args_var": args_var,
                     "delay_var": delay_var,
                     "enabled_var": enabled_var,
+                    "launch_method_var": launch_method_var,
+                    "scheduled_task_name_var": scheduled_task_name_var,
                     "readiness_type_var": readiness_type_var,
                     "readiness_target_var": readiness_target_var,
                     "readiness_timeout_var": readiness_timeout_var,
@@ -3932,11 +4591,14 @@ class BootManagerApp(ctk.CTk):
                     "snap_width_var": snap_width_var,
                     "snap_height_var": snap_height_var,
                     "snap_timeout_var": snap_timeout_var,
+                    "health_badge": health_badge,
+                    "health_key": health_key,
                 }
             )
             self.rendered_step_cards.append(card)
         self.suspend_dirty_tracking = False
         self.editor_dirty = False
+        self.refresh_heartbeat_snapshot()
         self.refresh_action_states()
         self.log_perf(
             "render_selected_mode",
@@ -3979,6 +4641,18 @@ class BootManagerApp(ctk.CTk):
     def schedule_auto_start_if_enabled(self) -> None:
         if self.launch_auto_start_scheduled or not self.config_valid:
             return
+        if self.startup_invocation:
+            if self.selected_mode_index is None:
+                self.logger.error(
+                    "Startup invocation requested but no selected mode is available."
+                )
+                self.set_status("Startup failed: no selected mode")
+                return
+
+            self.launch_auto_start_scheduled = True
+            self.startup_run_requested = True
+            self.after(250, self.auto_start_selected_mode_after_load)
+            return
         if not self.config_data.get("auto_start_on_launch"):
             return
         if self.selected_mode_index is None:
@@ -3990,14 +4664,46 @@ class BootManagerApp(ctk.CTk):
     def auto_start_selected_mode_after_load(self) -> None:
         if self.is_shutting_down or not self.config_valid:
             return
-        self.logger.info("Auto-start enabled. Running selected mode after app launch.")
-        self.set_status("Auto-starting selected mode...")
+        if self.startup_invocation:
+            self.logger.info(
+                "Startup invocation enabled. Running selected mode after app launch."
+            )
+            self.set_status("Startup: running selected mode...")
+        else:
+            self.logger.info(
+                "Auto-start enabled. Running selected mode after app launch."
+            )
+            self.set_status("Auto-starting selected mode...")
         self.run_selected_mode()
+
+    def handle_startup_run_finished(self, succeeded: bool) -> None:
+        if not self.startup_invocation or not self.startup_run_requested:
+            return
+
+        if succeeded:
+            self.startup_run_completed_successfully = True
+            if self.startup_auto_close and not self.is_shutting_down:
+                self.logger.info("Startup run completed successfully. Closing app.")
+                self.set_status("Startup complete; closing...")
+                self.after(250, self.destroy_after_startup_success)
+            return
+
+        self.logger.warning(
+            "Startup run did not complete successfully. App will remain open."
+        )
+        self.set_status("Startup failed; app left open")
+
+    def destroy_after_startup_success(self) -> None:
+        if self.is_shutting_down or not self.startup_run_completed_successfully:
+            return
+        self.on_close()
 
     def open_process_scan_dialog(self) -> None:
         if not self.config_valid or self.selected_mode_index is None:
             return
-        if not self.sync_selected_mode_if_needed(show_dialog=True, reason="scan_dialog"):
+        if not self.sync_selected_mode_if_needed(
+            show_dialog=True, reason="scan_dialog"
+        ):
             return
 
         process_entries = self.collect_running_process_entries()
@@ -4018,7 +4724,9 @@ class BootManagerApp(ctk.CTk):
         current_pid = os.getpid()
         visible_window_titles_by_pid = get_visible_window_titles_by_pid()
 
-        for process in psutil.process_iter(["pid", "name", "exe", "cmdline", "username"]):
+        for process in psutil.process_iter(
+            ["pid", "name", "exe", "cmdline", "username"]
+        ):
             try:
                 process_info = process.info
                 process_pid = process_info.get("pid")
@@ -4056,7 +4764,9 @@ class BootManagerApp(ctk.CTk):
                 seen_signatures.add(signature)
                 entries.append(
                     {
-                        "display_name": derive_import_step_name(process_name, executable_path),
+                        "display_name": derive_import_step_name(
+                            process_name, executable_path
+                        ),
                         "classification": classification,
                         "path": executable_path,
                         "args": args,
@@ -4114,6 +4824,8 @@ class BootManagerApp(ctk.CTk):
                     "args": list(entry["args"]),
                     "delay_after": 0,
                     "enabled": True,
+                    "launch_method": "normal",
+                    "scheduled_task_name": "",
                     "readiness": make_default_readiness(),
                     "process_ready": make_default_process_ready(),
                     "window_snap": make_default_window_snap(),
@@ -4145,12 +4857,14 @@ class BootManagerApp(ctk.CTk):
             summary += f". Skipped {skipped_count} duplicate"
             if skipped_count != 1:
                 summary += "s"
-        self.set_status(f"Imported {imported_count} running app{'s' if imported_count != 1 else ''}")
+        self.set_status(
+            f"Imported {imported_count} running app{'s' if imported_count != 1 else ''}"
+        )
         messagebox.showinfo("Scan Running Apps", summary + ".")
 
     def process_log_queue(self) -> None:
+        pending_messages: list[str] = []
         try:
-            pending_messages: list[str] = []
             while True:
                 message = self.log_queue.get_nowait()
                 pending_messages.append(message)
@@ -4169,8 +4883,8 @@ class BootManagerApp(ctk.CTk):
                     pass
 
     def process_status_queue(self) -> None:
+        latest_status: str | None = None
         try:
-            latest_status: str | None = None
             while True:
                 latest_status = self.status_queue.get_nowait()
         except Empty:
@@ -4184,13 +4898,204 @@ class BootManagerApp(ctk.CTk):
                 except TclError:
                     pass
 
-    def sync_selected_mode_from_widgets(self, show_dialog: bool, reason: str = "manual") -> bool:
+    def process_health_queue(self) -> None:
+        latest_payload: dict | None = None
+        try:
+            while True:
+                latest_payload = self.health_queue.get_nowait()
+        except Empty:
+            if latest_payload is not None:
+                self.apply_health_update(latest_payload)
+        finally:
+            if not self.is_shutting_down:
+                try:
+                    if self.winfo_exists():
+                        self.after(UI_QUEUE_POLL_MS, self.process_health_queue)
+                except TclError:
+                    pass
+
+    def on_heartbeat_enabled_changed(self, *_args: object) -> None:
+        self.on_editor_changed()
+        self.heartbeat_enabled_runtime = bool(self.heartbeat_enabled_var.get())
+        if not self.heartbeat_enabled_runtime:
+            self.set_visible_mode_health_unknown()
+        self.refresh_heartbeat_snapshot()
+
+    def start_heartbeat_monitoring(self) -> None:
+        if self.heartbeat_thread is not None:
+            return
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat_worker,
+            name="heartbeat-monitor",
+            daemon=True,
+        )
+        self.heartbeat_thread.start()
+
+    def refresh_heartbeat_snapshot(self) -> None:
+        snapshot: dict | None = None
+        if (
+            self.config_valid
+            and self.selected_mode_index is not None
+            and 0 <= self.selected_mode_index < len(self.config_data.get("modes", []))
+        ):
+            mode = self.config_data["modes"][self.selected_mode_index]
+            snapshot = {
+                "mode_id": mode["id"],
+                "mode_name": mode["name"],
+                "steps": copy.deepcopy(mode["steps"]),
+            }
+
+        with self.heartbeat_snapshot_lock:
+            self.heartbeat_mode_snapshot = snapshot
+            self.heartbeat_enabled_runtime = bool(
+                self.heartbeat_enabled_var.get()
+                if hasattr(self, "heartbeat_enabled_var")
+                else self.config_data.get("heartbeat_enabled", True)
+            )
+            self.heartbeat_interval_runtime = int(
+                self.config_data.get(
+                    "heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+                )
+            )
+
+        self.heartbeat_wakeup_event.set()
+
+    def make_step_health_key(self, mode_id: str, step_index: int) -> tuple[str, int]:
+        return (mode_id, step_index)
+
+    def configure_health_badge(self, label: ctk.CTkLabel, status: str) -> None:
+        if status == HEARTBEAT_HEALTHY:
+            label.configure(
+                text="Healthy",
+                fg_color=("#DCFCE7", "#14532D"),
+                text_color=("#166534", "#DCFCE7"),
+            )
+        elif status == HEARTBEAT_UNHEALTHY:
+            label.configure(
+                text="Unhealthy",
+                fg_color=("#FEE2E2", "#7F1D1D"),
+                text_color=("#991B1B", "#FEE2E2"),
+            )
+        else:
+            label.configure(
+                text="Unknown",
+                fg_color=("#E5E7EB", "#374151"),
+                text_color=("#4B5563", "#E5E7EB"),
+            )
+
+    def set_visible_mode_health_unknown(self) -> None:
+        if self.selected_mode_index is None:
+            return
+        mode_id = self.config_data["modes"][self.selected_mode_index]["id"]
+        for index, widget in enumerate(self.step_widgets):
+            health_key = self.make_step_health_key(mode_id, index)
+            self.step_health_states[health_key] = HEARTBEAT_UNKNOWN
+            health_badge = widget.get("health_badge")
+            if isinstance(health_badge, ctk.CTkLabel):
+                self.configure_health_badge(health_badge, HEARTBEAT_UNKNOWN)
+
+    def apply_health_update(self, payload: dict) -> None:
+        if self.selected_mode_index is None:
+            return
+        mode = self.config_data["modes"][self.selected_mode_index]
+        mode_id = mode["id"]
+        if payload.get("mode_id") != mode_id:
+            return
+
+        statuses = payload.get("statuses", {})
+        if not isinstance(statuses, dict):
+            return
+
+        for index, step in enumerate(mode["steps"]):
+            health_key = self.make_step_health_key(mode_id, index)
+            new_status = str(statuses.get(index, HEARTBEAT_UNKNOWN))
+            if new_status not in {
+                HEARTBEAT_UNKNOWN,
+                HEARTBEAT_HEALTHY,
+                HEARTBEAT_UNHEALTHY,
+            }:
+                new_status = HEARTBEAT_UNKNOWN
+            old_status = self.step_health_states.get(health_key)
+            self.step_health_states[health_key] = new_status
+
+            if index < len(self.step_widgets):
+                health_badge = self.step_widgets[index].get("health_badge")
+                if isinstance(health_badge, ctk.CTkLabel):
+                    self.configure_health_badge(health_badge, new_status)
+
+            if old_status == new_status:
+                continue
+            if old_status is None and new_status == HEARTBEAT_UNKNOWN:
+                continue
+            if old_status == HEARTBEAT_UNKNOWN and new_status == HEARTBEAT_UNKNOWN:
+                continue
+            self.logger.info("Health changed: %s -> %s", step["name"], new_status)
+
+    def evaluate_step_health(self, step: dict) -> str:
+        if not step.get("enabled", False):
+            return HEARTBEAT_UNKNOWN
+
+        results: list[bool] = []
+        readiness = normalize_readiness_config(step.get("readiness"))
+        if readiness["type"] == "port" and readiness["target"]:
+            results.append(self.check_port_readiness(readiness["target"]))
+        elif readiness["type"] == "url" and readiness["target"]:
+            results.append(self.check_url_readiness(readiness["target"]))
+
+        process_ready = normalize_process_ready_config(
+            step.get("process_ready"),
+            step.get("type", "path"),
+            step.get("path", ""),
+        )
+        if process_ready["enabled"] and process_ready["name"]:
+            target_basename = Path(str(process_ready["name"]).strip()).name.lower()
+            target_stem = Path(target_basename).stem.lower()
+            results.append(
+                self.find_running_process_by_name(target_basename, target_stem, None)
+                is not None
+            )
+
+        if not results:
+            return HEARTBEAT_UNKNOWN
+        return HEARTBEAT_HEALTHY if all(results) else HEARTBEAT_UNHEALTHY
+
+    def _heartbeat_worker(self) -> None:
+        while not self.heartbeat_stop_event.is_set():
+            with self.heartbeat_snapshot_lock:
+                snapshot = copy.deepcopy(self.heartbeat_mode_snapshot)
+                heartbeat_enabled = self.heartbeat_enabled_runtime
+                heartbeat_interval = max(1, int(self.heartbeat_interval_runtime))
+
+            if heartbeat_enabled and snapshot is not None:
+                statuses = {
+                    index: self.evaluate_step_health(step)
+                    for index, step in enumerate(snapshot.get("steps", []))
+                }
+                self.health_queue.put(
+                    {
+                        "mode_id": snapshot.get("mode_id"),
+                        "statuses": statuses,
+                    }
+                )
+
+            if self.heartbeat_wakeup_event.wait(heartbeat_interval):
+                self.heartbeat_wakeup_event.clear()
+
+    def sync_selected_mode_from_widgets(
+        self, show_dialog: bool, reason: str = "manual"
+    ) -> bool:
         started_at = time.perf_counter()
         result = False
         step_count = len(self.step_widgets)
         commit_requested = self.should_sync_editor_state()
         try:
             if self.selected_mode_index is None:
+                self.config_data["auto_start_on_launch"] = bool(
+                    self.auto_start_var.get()
+                )
+                self.config_data["heartbeat_enabled"] = bool(
+                    self.heartbeat_enabled_var.get()
+                )
                 result = True
                 return True
 
@@ -4205,7 +5110,9 @@ class BootManagerApp(ctk.CTk):
             mode_name = self.mode_name_var.get().strip()
             if not mode_name:
                 if show_dialog:
-                    messagebox.showerror("Invalid Mode Name", "Mode name cannot be empty.")
+                    messagebox.showerror(
+                        "Invalid Mode Name", "Mode name cannot be empty."
+                    )
                 return False
 
             updated_steps = []
@@ -4216,13 +5123,21 @@ class BootManagerApp(ctk.CTk):
                 args_text = widget["args_var"].get()
                 delay_text = widget["delay_var"].get()
                 enabled = bool(widget["enabled_var"].get())
+                launch_method = get_launch_method_value_from_label(
+                    widget["launch_method_var"].get().strip()
+                )
+                scheduled_task_name = widget["scheduled_task_name_var"].get().strip()
                 readiness_type = widget["readiness_type_var"].get().strip()
                 readiness_target = widget["readiness_target_var"].get().strip()
                 readiness_timeout_text = widget["readiness_timeout_var"].get().strip()
                 process_ready_enabled = bool(widget["process_ready_enabled_var"].get())
                 process_ready_name = widget["process_ready_name_var"].get().strip()
-                process_ready_timeout_text = widget["process_ready_timeout_var"].get().strip()
-                process_settle_delay_text = widget["process_settle_delay_var"].get().strip()
+                process_ready_timeout_text = (
+                    widget["process_ready_timeout_var"].get().strip()
+                )
+                process_settle_delay_text = (
+                    widget["process_settle_delay_var"].get().strip()
+                )
                 if step_type != "path":
                     process_ready_enabled = False
                     widget["process_ready_enabled_var"].set(False)
@@ -4238,14 +5153,16 @@ class BootManagerApp(ctk.CTk):
                 if not step_name:
                     if show_dialog:
                         messagebox.showerror(
-                            "Invalid Step Name", f"Step {index} must have a non-empty name."
+                            "Invalid Step Name",
+                            f"Step {index} must have a non-empty name.",
                         )
                     return False
 
                 if step_type not in STEP_TYPES:
                     if show_dialog:
                         messagebox.showerror(
-                            "Invalid Step Type", f"Step '{step_name}' has an unsupported type."
+                            "Invalid Step Type",
+                            f"Step '{step_name}' has an unsupported type.",
                         )
                     return False
                 if readiness_type not in READINESS_TYPES:
@@ -4274,7 +5191,7 @@ class BootManagerApp(ctk.CTk):
                                 f"Step '{step_name}' has invalid arguments.\n\n"
                                 f"Input:\n{args_text or '(empty)'}\n\n"
                                 f"Problem: {exc}\n\n"
-                                'Use balanced quotes for values with spaces.\n'
+                                "Use balanced quotes for values with spaces.\n"
                                 'Example: --profile-directory="Profile 1"'
                             ),
                         )
@@ -4288,7 +5205,9 @@ class BootManagerApp(ctk.CTk):
                 )
                 widget["readiness_timeout_var"].set(str(normalized_readiness_timeout))
                 if process_ready_enabled and not process_ready_name:
-                    process_ready_name = derive_default_process_ready_name(step_type, path)
+                    process_ready_name = derive_default_process_ready_name(
+                        step_type, path
+                    )
                 normalized_process_ready_timeout = self.normalize_positive_int(
                     process_ready_timeout_text,
                     DEFAULT_PROCESS_READY_TIMEOUT_SECONDS,
@@ -4300,8 +5219,12 @@ class BootManagerApp(ctk.CTk):
                     f"{step_name} process settle delay",
                 )
                 widget["process_ready_name_var"].set(process_ready_name)
-                widget["process_ready_timeout_var"].set(str(normalized_process_ready_timeout))
-                widget["process_settle_delay_var"].set(str(normalized_process_settle_delay))
+                widget["process_ready_timeout_var"].set(
+                    str(normalized_process_ready_timeout)
+                )
+                widget["process_settle_delay_var"].set(
+                    str(normalized_process_settle_delay)
+                )
                 normalized_snap_x = self.normalize_signed_int(snap_x_text, 0)
                 normalized_snap_y = self.normalize_signed_int(snap_y_text, 0)
                 normalized_snap_width = self.normalize_positive_int(
@@ -4377,9 +5300,13 @@ class BootManagerApp(ctk.CTk):
                         "args": parsed_args,
                         "delay_after": normalized_delay,
                         "enabled": enabled,
+                        "launch_method": launch_method,
+                        "scheduled_task_name": scheduled_task_name,
                         "readiness": {
                             "type": readiness_type,
-                            "target": readiness_target if readiness_type != "none" else "",
+                            "target": readiness_target
+                            if readiness_type != "none"
+                            else "",
                             "timeout_seconds": normalized_readiness_timeout,
                         },
                         "process_ready": {
@@ -4406,9 +5333,13 @@ class BootManagerApp(ctk.CTk):
             mode["name"] = mode_name
             mode["steps"] = updated_steps
             self.config_data["auto_start_on_launch"] = bool(self.auto_start_var.get())
+            self.config_data["heartbeat_enabled"] = bool(
+                self.heartbeat_enabled_var.get()
+            )
             self.config_data["selected_mode_id"] = mode["id"]
             if self.selected_mode_index < len(self.mode_buttons):
                 self.mode_buttons[self.selected_mode_index].configure(text=mode_name)
+            self.refresh_heartbeat_snapshot()
             if commit_requested:
                 self.is_dirty = True
             self.editor_dirty = False
@@ -4442,17 +5373,29 @@ class BootManagerApp(ctk.CTk):
     def normalize_timeout(self, raw_value: str, label: str) -> int:
         text = str(raw_value).strip()
         if not text:
-            self.logger.warning("Normalized timeout for %s to %s", label, DEFAULT_READINESS_TIMEOUT_SECONDS)
+            self.logger.warning(
+                "Normalized timeout for %s to %s",
+                label,
+                DEFAULT_READINESS_TIMEOUT_SECONDS,
+            )
             return DEFAULT_READINESS_TIMEOUT_SECONDS
 
         try:
             value = int(text)
         except ValueError:
-            self.logger.warning("Normalized timeout for %s to %s", label, DEFAULT_READINESS_TIMEOUT_SECONDS)
+            self.logger.warning(
+                "Normalized timeout for %s to %s",
+                label,
+                DEFAULT_READINESS_TIMEOUT_SECONDS,
+            )
             return DEFAULT_READINESS_TIMEOUT_SECONDS
 
         if value <= 0:
-            self.logger.warning("Normalized timeout for %s to %s", label, DEFAULT_READINESS_TIMEOUT_SECONDS)
+            self.logger.warning(
+                "Normalized timeout for %s to %s",
+                label,
+                DEFAULT_READINESS_TIMEOUT_SECONDS,
+            )
             return DEFAULT_READINESS_TIMEOUT_SECONDS
 
         return value
@@ -4475,7 +5418,9 @@ class BootManagerApp(ctk.CTk):
 
         return value
 
-    def normalize_non_negative_int(self, raw_value: str, fallback: int, label: str) -> int:
+    def normalize_non_negative_int(
+        self, raw_value: str, fallback: int, label: str
+    ) -> int:
         text = str(raw_value).strip()
         if not text:
             self.logger.warning("Normalized %s to %s", label, fallback)
@@ -4506,7 +5451,9 @@ class BootManagerApp(ctk.CTk):
     def save_config(self) -> bool:
         if not self.config_valid:
             return False
-        if not self.sync_selected_mode_from_widgets(show_dialog=True, reason="save_config"):
+        if not self.sync_selected_mode_from_widgets(
+            show_dialog=True, reason="save_config"
+        ):
             return False
 
         try:
@@ -4522,6 +5469,10 @@ class BootManagerApp(ctk.CTk):
             return False
 
         self.config_data = validated_payload
+        self.heartbeat_enabled_var.set(
+            bool(self.config_data.get("heartbeat_enabled", True))
+        )
+        self.refresh_heartbeat_snapshot()
         self.set_dirty(False)
         self.logger.info("Saved config to %s", CONFIG_PATH)
         self.set_status("Config saved")
@@ -4530,10 +5481,14 @@ class BootManagerApp(ctk.CTk):
     def run_selected_mode(self) -> None:
         if not self.config_valid or self.is_running or self.selected_mode_index is None:
             return
-        if not self.sync_selected_mode_if_needed(show_dialog=True, reason="run_selected_mode"):
+        if not self.sync_selected_mode_if_needed(
+            show_dialog=True, reason="run_selected_mode"
+        ):
             return
 
-        mode_snapshot = copy.deepcopy(self.config_data["modes"][self.selected_mode_index])
+        mode_snapshot = copy.deepcopy(
+            self.config_data["modes"][self.selected_mode_index]
+        )
         self.stop_event.clear()
         self.set_run_state(True)
         self.set_status(f"Running mode: {mode_snapshot['name']}")
@@ -4558,7 +5513,9 @@ class BootManagerApp(ctk.CTk):
 
             for step in mode["steps"]:
                 if self.stop_event.is_set():
-                    self.logger.warning("Stopped before step '%s' could start.", step["name"])
+                    self.logger.warning(
+                        "Stopped before step '%s' could start.", step["name"]
+                    )
                     self.enqueue_status(f"Stopped before step: {step['name']}")
                     stop_requested = True
                     break
@@ -4571,7 +5528,9 @@ class BootManagerApp(ctk.CTk):
                 if not launch_result["launched"]:
                     continue
 
-                process_ready_succeeded = self.wait_for_step_process_ready(step, launch_result)
+                process_ready_succeeded = self.wait_for_step_process_ready(
+                    step, launch_result
+                )
                 if not process_ready_succeeded and self.stop_event.is_set():
                     stop_requested = True
                     break
@@ -4587,14 +5546,19 @@ class BootManagerApp(ctk.CTk):
                 if delay_after <= 0:
                     continue
 
-                self.logger.info("Waiting %s seconds after step: %s", delay_after, step["name"])
+                self.logger.info(
+                    "Waiting %s seconds after step: %s", delay_after, step["name"]
+                )
                 for remaining in range(delay_after, 0, -1):
                     self.enqueue_status(f"Waiting: {remaining}s after {step['name']}")
                     if self.stop_event.is_set():
                         self.logger.warning(
-                            "Stop detected during delay countdown after step '%s'.", step["name"]
+                            "Stop detected during delay countdown after step '%s'.",
+                            step["name"],
                         )
-                        self.enqueue_status(f"Stop detected during wait after {step['name']}")
+                        self.enqueue_status(
+                            f"Stop detected during wait after {step['name']}"
+                        )
                         stop_requested = True
                         break
                     time.sleep(1)
@@ -4608,9 +5572,12 @@ class BootManagerApp(ctk.CTk):
             else:
                 self.logger.info("Boot sequence complete.")
                 self.enqueue_status("Boot sequence complete")
+            success = not stop_requested
+            self.after(0, lambda: self.handle_startup_run_finished(success))
         except Exception as exc:
             self.logger.exception("Unhandled error while running boot mode: %s", exc)
             self.enqueue_status("Run failed")
+            self.after(0, lambda: self.handle_startup_run_finished(False))
         finally:
             if not self.is_shutting_down:
                 try:
@@ -4878,7 +5845,10 @@ class BootManagerApp(ctk.CTk):
 
     def wait_for_window_snap(self, step: dict, launch_result: dict) -> bool:
         window_snap = normalize_window_snap_config(step.get("window_snap"))
-        if not window_snap["snap_enabled"] or window_snap["window_match_mode"] == "none":
+        if (
+            not window_snap["snap_enabled"]
+            or window_snap["window_match_mode"] == "none"
+        ):
             return True
 
         timeout_seconds = window_snap["snap_timeout_sec"]
@@ -4914,7 +5884,9 @@ class BootManagerApp(ctk.CTk):
                         selected_window["title"],
                         selected_window["pid"],
                     )
-                snap_success = self.apply_window_snap(selected_window["hwnd"], window_snap)
+                snap_success = self.apply_window_snap(
+                    selected_window["hwnd"], window_snap
+                )
                 if snap_success:
                     self.logger.info(
                         "Snapped window for step '%s' to x=%s y=%s w=%s h=%s.",
@@ -4942,7 +5914,9 @@ class BootManagerApp(ctk.CTk):
 
             elapsed_int = int(elapsed_seconds)
             remaining = max(0, timeout_seconds - elapsed_int)
-            self.enqueue_status(f"Waiting for window: {step['name']} ({remaining}s left)")
+            self.enqueue_status(
+                f"Waiting for window: {step['name']} ({remaining}s left)"
+            )
             if elapsed_int >= next_log_elapsed:
                 self.logger.info(
                     "Still waiting to snap window for step '%s' (%ss elapsed, mode=%s, value=%s)",
@@ -4955,7 +5929,9 @@ class BootManagerApp(ctk.CTk):
 
             time.sleep(WINDOW_SNAP_POLL_INTERVAL_SECONDS)
 
-    def find_matching_windows(self, window_snap: dict, launched_pid: int | None) -> list[dict]:
+    def find_matching_windows(
+        self, window_snap: dict, launched_pid: int | None
+    ) -> list[dict]:
         windows = enumerate_visible_top_level_windows()
         match_mode = window_snap["window_match_mode"]
         match_value = window_snap["window_match_value"].strip().lower()
@@ -4974,7 +5950,9 @@ class BootManagerApp(ctk.CTk):
                 process_basename = Path(process_name).name.lower()
                 process_stem = Path(process_basename).stem.lower()
                 value_stem = Path(match_value).stem.lower()
-                matches_window = process_basename == match_value or process_stem == value_stem
+                matches_window = (
+                    process_basename == match_value or process_stem == value_stem
+                )
 
             if matches_window:
                 rect_info = get_window_rect_info(window["hwnd"])
@@ -5049,7 +6027,11 @@ class BootManagerApp(ctk.CTk):
         current_value = snap_match_value_var.get().strip()
         derived_match = False
 
-        if current_mode in WINDOW_MATCH_MODES and current_mode != "none" and current_value:
+        if (
+            current_mode in WINDOW_MATCH_MODES
+            and current_mode != "none"
+            and current_value
+        ):
             window_snap = {
                 "snap_enabled": True,
                 "window_match_mode": current_mode,
@@ -5125,7 +6107,11 @@ class BootManagerApp(ctk.CTk):
         snap_y_var.set(str(rect_info["y"]))
         snap_width_var.set(str(rect_info["width"]))
         snap_height_var.set(str(rect_info["height"]))
-        if derived_match or snap_match_mode_var.get() == "none" or not snap_match_value_var.get().strip():
+        if (
+            derived_match
+            or snap_match_mode_var.get() == "none"
+            or not snap_match_value_var.get().strip()
+        ):
             snap_match_mode_var.set(str(window_snap["window_match_mode"]))
             snap_match_value_var.set(str(window_snap["window_match_value"]))
 
@@ -5148,17 +6134,161 @@ class BootManagerApp(ctk.CTk):
         )
         self.set_status(f"Captured window: {step_name}")
 
+    def build_path_launch_command(
+        self, expanded_path: str, args: list[str]
+    ) -> list[str]:
+        suffix = Path(expanded_path).suffix.lower()
+        if suffix in {".bat", ".cmd"}:
+            return ["cmd.exe", "/c", expanded_path, *args]
+        return [expanded_path, *args]
+
+    def build_elevated_launch_target(
+        self, expanded_path: str, args: list[str]
+    ) -> tuple[str, str | None]:
+        suffix = Path(expanded_path).suffix.lower()
+        if suffix in {".bat", ".cmd"}:
+            return ("cmd.exe", subprocess.list2cmdline(["/c", expanded_path, *args]))
+        return (
+            expanded_path,
+            subprocess.list2cmdline(args) if args else None,
+        )
+
+    def describe_shell_execute_error(self, result_code: int, last_error: int) -> str:
+        shell_execute_errors = {
+            2: "file not found",
+            3: "path not found",
+            5: "access denied",
+            8: "out of memory",
+            26: "sharing violation",
+            27: "association incomplete",
+            28: "DDE timeout",
+            29: "DDE failure",
+            30: "DDE busy",
+            31: "no application is associated with the file",
+            32: "DLL not found",
+        }
+        if last_error == 1223:
+            return "UAC elevation was canceled by the user"
+        if result_code in shell_execute_errors:
+            return shell_execute_errors[result_code]
+        if last_error:
+            return f"Windows error {last_error}"
+        return f"ShellExecuteW error {result_code}"
+
+    def launch_path_step_elevated(self, step: dict, expanded_path: str) -> dict:
+        name = step["name"]
+        args = list(step.get("args", []))
+        launch_result = {"launched": False, "pid": None}
+        executable, parameters = self.build_elevated_launch_target(expanded_path, args)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell_execute = shell32.ShellExecuteW
+        shell_execute.argtypes = [
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        ]
+        shell_execute.restype = wintypes.HINSTANCE
+
+        ctypes.set_last_error(0)
+        result = shell_execute(None, "runas", executable, parameters, None, 1)
+        result_code = int(result)
+        if result_code <= 32:
+            error_message = self.describe_shell_execute_error(
+                result_code, ctypes.get_last_error()
+            )
+            self.logger.error("Failed to launch %s elevated: %s", name, error_message)
+            return launch_result
+
+        self.logger.info("Launched step elevated: %s", name)
+        launch_result["launched"] = True
+        return launch_result
+
+    def launch_step_via_scheduled_task(self, step: dict) -> dict:
+        launch_result = {"launched": False, "pid": None}
+        task_name = str(step.get("scheduled_task_name", "")).strip()
+        if not task_name:
+            self.logger.error(
+                "Failed to launch %s via scheduled task: task name is blank",
+                step["name"],
+            )
+            return launch_result
+
+        command = ["schtasks", "/run", "/tn", task_name]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "Failed to launch %s via scheduled task '%s': %s",
+                step["name"],
+                task_name,
+                exc,
+            )
+            return launch_result
+
+        if result.returncode != 0:
+            error_output = (result.stderr or result.stdout or "").strip()
+            self.logger.error(
+                "Failed to trigger scheduled task for %s ('%s'): %s",
+                step["name"],
+                task_name,
+                error_output or f"exit code {result.returncode}",
+            )
+            return launch_result
+
+        self.logger.info(
+            "Launched step via scheduled task: %s (task: %s)",
+            step["name"],
+            task_name,
+        )
+        launch_result["launched"] = True
+        return launch_result
+
+    def launch_path_step(self, step: dict, expanded_path: str) -> dict:
+        launch_result = {"launched": False, "pid": None}
+        command = self.build_path_launch_command(
+            expanded_path, list(step.get("args", []))
+        )
+        try:
+            process = subprocess.Popen(command)
+        except Exception as exc:
+            self.logger.error("Failed to launch %s: %s", step["name"], exc)
+            return launch_result
+
+        launch_result["launched"] = True
+        launch_result["pid"] = process.pid
+        return launch_result
+
     def launch_step(self, step: dict) -> dict:
         name = step["name"]
         step_type = step["type"]
         path = step["path"]
         args = step["args"]
+        launch_method = normalize_launch_method(
+            step.get("launch_method"),
+            legacy_run_as_admin=normalize_run_as_admin(step.get("run_as_admin")),
+        )
         launch_result = {"launched": False, "pid": None}
 
         self.logger.info("Starting step: %s", name)
         self.enqueue_status(f"Starting step: {name}")
 
+        if launch_method == "scheduled_task":
+            return self.launch_step_via_scheduled_task(step)
+
         if step_type == "url":
+            if launch_method == "elevated_uac":
+                self.logger.info(
+                    "Elevated (UAC) launch applies to path steps only. Opening URL step '%s' normally.",
+                    name,
+                )
             try:
                 opened = webbrowser.open(path)
             except Exception as exc:
@@ -5166,7 +6296,9 @@ class BootManagerApp(ctk.CTk):
                 return launch_result
 
             if not opened:
-                self.logger.error("Failed to launch %s: browser refused URL %s", name, path)
+                self.logger.error(
+                    "Failed to launch %s: browser refused URL %s", name, path
+                )
                 return launch_result
             launch_result["launched"] = True
             return launch_result
@@ -5182,20 +6314,11 @@ class BootManagerApp(ctk.CTk):
             self.enqueue_status(f"Skipped step: {name} (already running)")
             return launch_result
 
-        suffix = Path(expanded_path).suffix.lower()
-        command = [expanded_path, *args]
-        if suffix in {".bat", ".cmd"}:
-            command = ["cmd.exe", "/c", expanded_path, *args]
-
-        try:
-            process = subprocess.Popen(command)
-        except Exception as exc:
-            self.logger.error("Failed to launch %s: %s", name, exc)
-            return launch_result
-
-        launch_result["launched"] = True
-        launch_result["pid"] = process.pid
-        return launch_result
+        if launch_method == "elevated_uac":
+            self.logger.info("Launching step with Elevated (UAC): %s", name)
+            self.logger.info("UAC may appear for step '%s'.", name)
+            return self.launch_path_step_elevated(step, expanded_path)
+        return self.launch_path_step(step, expanded_path)
 
     def on_close(self) -> None:
         if self.is_running:
@@ -5230,11 +6353,31 @@ class BootManagerApp(ctk.CTk):
 
         self.is_shutting_down = True
         self.stop_event.set()
+        self.heartbeat_stop_event.set()
+        self.heartbeat_wakeup_event.set()
+        if self.heartbeat_thread is not None and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=1.0)
         self.destroy()
 
 
 def main() -> None:
-    app = BootManagerApp()
+    parser = argparse.ArgumentParser(description="AI Workstation Boot Manager")
+    parser.add_argument(
+        "--startup",
+        action="store_true",
+        help="Auto-run the selected mode after launch.",
+    )
+    parser.add_argument(
+        "--startup-auto-close",
+        action="store_true",
+        help="Close the app after a successful startup auto-run.",
+    )
+    args = parser.parse_args()
+
+    app = BootManagerApp(
+        startup_invocation=args.startup,
+        startup_auto_close=args.startup_auto_close,
+    )
     app.mainloop()
 
 
